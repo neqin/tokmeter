@@ -1,14 +1,17 @@
 //! Лимиты подписок агентов.
 //! - Claude: OAuth usage (`~/.claude/.credentials.json`)
 //! - Codex: ChatGPT wham/usage + passive token_count rate_limits
-//! - Grok: OAuth token from `~/.grok/auth.json` → minimal chat call;
-//!   single bar from `x-ratelimit-remaining-tokens` / limit headers
-//!   (subscription chat quotas on grok.com are not exposed to this token).
+//! - Grok: `grok agent stdio` → `_x.ai/billing` (weekly SuperGrok bar);
+//!   fallback TPM/RPM only when no weekly snap is available
 
 use super::timeutil::parse_epoch;
 use serde_json::Value;
-use std::io::Write;
+use std::io::{BufRead, BufReader, Write};
+use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
+use std::sync::mpsc;
+use std::thread;
+use std::time::Duration;
 
 /// Одно окно лимита: подпись ("5h"/"wk"/имя модели), процент, epoch сброса
 /// (0 — неизвестен).
@@ -228,28 +231,62 @@ fn window_label(mins: i64, fallback: &str) -> &str {
 ///
 /// Primary: `grok agent stdio` → `authenticate(cached_token)` → `_x.ai/billing`
 /// returns `config.creditUsagePercent` + weekly period end (Settings→Usage).
-/// Fallback: api.x.ai rate-limit headers from a 1-token chat call (`api` bar).
-pub fn fetch_grok(home: &str, now: i64) -> Option<Snapshot> {
+/// Fallback: api.x.ai rate-limit headers (`api` bar) — only when there is no
+/// existing weekly/monthly subscription snap to preserve.
+pub fn fetch_grok(home: &str, now: i64, prev: Option<&Snapshot>) -> Option<Snapshot> {
     if let Some(snap) = fetch_grok_cli_billing(home, now) {
         return Some(snap);
+    }
+    // TPM/RPM headers are not the SuperGrok weekly quota. Never clobber a
+    // real `wk`/`mo` bar with `api 0%`.
+    if grok_has_subscription_bar(prev) {
+        return None;
     }
     fetch_grok_api_headers(home, now)
 }
 
-/// Spawn `grok agent stdio`, auth with cached OAuth, call `_x.ai/billing`.
-fn fetch_grok_cli_billing(home: &str, now: i64) -> Option<Snapshot> {
-    use std::thread;
-    use std::time::Duration;
+/// True when a prior snap already carries SuperGrok weekly/monthly usage.
+fn grok_has_subscription_bar(prev: Option<&Snapshot>) -> bool {
+    prev.is_some_and(|s| {
+        s.windows
+            .iter()
+            .any(|w| matches!(w.label.as_str(), "wk" | "mo"))
+    })
+}
 
-    let _ = home;
-    let mut child = Command::new("grok")
-        .args(["agent", "stdio"])
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::null())
-        .spawn()
-        .ok()?;
-    let mut stdin = child.stdin.take()?;
+fn resolve_grok_bin(home: &str) -> PathBuf {
+    let local = Path::new(home).join(".grok/bin/grok");
+    if local.is_file() {
+        return local;
+    }
+    PathBuf::from("grok")
+}
+
+/// Kill + wait on drop so early `?` after spawn cannot leave a zombie.
+struct ReapOnDrop(std::process::Child);
+
+impl Drop for ReapOnDrop {
+    fn drop(&mut self) {
+        drop(self.0.stdin.take());
+        let _ = self.0.kill();
+        let _ = self.0.wait();
+    }
+}
+
+/// Spawn `grok agent stdio`, auth with cached OAuth, call `_x.ai/billing`.
+/// Reads NDJSON until `creditUsagePercent` appears or a hard deadline hits.
+fn fetch_grok_cli_billing(home: &str, now: i64) -> Option<Snapshot> {
+    let mut child = ReapOnDrop(
+        Command::new(resolve_grok_bin(home))
+            .args(["agent", "stdio"])
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null())
+            .spawn()
+            .ok()?,
+    );
+    let mut stdin = child.0.stdin.take()?;
+    let stdout = child.0.stdout.take()?;
 
     let send = |stdin: &mut std::process::ChildStdin, line: &str| -> Option<()> {
         stdin.write_all(line.as_bytes()).ok()?;
@@ -262,34 +299,59 @@ fn fetch_grok_cli_billing(home: &str, now: i64) -> Option<Snapshot> {
         &mut stdin,
         r#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"1","clientCapabilities":{"fs":{"readTextFile":false,"writeTextFile":false},"terminal":false}}}"#,
     )?;
-    thread::sleep(Duration::from_millis(250));
     send(
         &mut stdin,
         r#"{"jsonrpc":"2.0","id":2,"method":"authenticate","params":{"methodId":"cached_token"}}"#,
     )?;
-    thread::sleep(Duration::from_millis(400));
     // Non-public extension (underscore-prefixed). Public names like
     // session/billing and x.ai/billing return Method not found on agent stdio.
     send(
         &mut stdin,
         r#"{"jsonrpc":"2.0","id":3,"method":"_x.ai/billing","params":{}}"#,
     )?;
-    thread::sleep(Duration::from_millis(800));
-    drop(stdin);
+    // Keep stdin open until reap: closing early makes grok exit before billing.
 
-    // Collect remaining stdout with a hard wall-clock budget via kill.
-    let out = {
-        let handle = thread::spawn(move || child.wait_with_output());
-        thread::sleep(Duration::from_millis(800));
-        match handle.join() {
-            Ok(Ok(o)) => o,
-            _ => return None,
+    // Agent emits skills-reload / announcements between RPC replies — scan the
+    // whole buffer for creditUsagePercent instead of waiting for consecutive ids.
+    let (tx, rx) = mpsc::channel::<String>();
+    thread::spawn(move || {
+        let mut reader = BufReader::new(stdout);
+        let mut all = String::new();
+        let mut line = String::new();
+        loop {
+            line.clear();
+            match reader.read_line(&mut line) {
+                Ok(0) => break,
+                Ok(_) => {
+                    all.push_str(&line);
+                    if parse_grok_session_billing(&all, now).is_some() {
+                        let _ = tx.send(all);
+                        return;
+                    }
+                }
+                Err(_) => break,
+            }
         }
-    };
-    if out.stdout.is_empty() {
+        let _ = tx.send(all);
+    });
+
+    let mut buf = rx.recv_timeout(Duration::from_secs(8)).unwrap_or_default();
+    // Close stdin + kill so the reader hits EOF and can flush remaining lines.
+    drop(stdin);
+    drop(child);
+    if let Ok(more) = rx.try_recv() {
+        if more.len() > buf.len() {
+            buf = more;
+        }
+    } else if buf.is_empty() {
+        if let Ok(more) = rx.recv_timeout(Duration::from_millis(300)) {
+            buf = more;
+        }
+    }
+    if buf.is_empty() {
         return None;
     }
-    parse_grok_session_billing(&String::from_utf8_lossy(&out.stdout), now)
+    parse_grok_session_billing(&buf, now)
 }
 
 fn parse_grok_session_billing(stdout: &str, now: i64) -> Option<Snapshot> {
@@ -608,5 +670,42 @@ x-ratelimit-remaining-requests: 900\r\n\
         assert_eq!(snap.windows[0].label, "wk");
         assert!((snap.windows[0].pct - 2.0).abs() < 0.01);
         assert!(snap.windows[0].resets > 0);
+    }
+
+    #[test]
+    fn grok_preserves_subscription_bar() {
+        let wk = Snapshot {
+            ts: 1,
+            checked: 1,
+            windows: vec![Window {
+                label: "wk".to_string(),
+                pct: 4.0,
+                resets: 99,
+            }],
+        };
+        let mo = Snapshot {
+            ts: 1,
+            checked: 1,
+            windows: vec![Window {
+                label: "mo".to_string(),
+                pct: 10.0,
+                resets: 99,
+            }],
+        };
+        let api = Snapshot {
+            ts: 1,
+            checked: 1,
+            windows: vec![Window {
+                label: "api".to_string(),
+                pct: 0.0,
+                resets: 0,
+            }],
+        };
+        let empty = Snapshot::default();
+        assert!(grok_has_subscription_bar(Some(&wk)));
+        assert!(grok_has_subscription_bar(Some(&mo)));
+        assert!(!grok_has_subscription_bar(Some(&api)));
+        assert!(!grok_has_subscription_bar(Some(&empty)));
+        assert!(!grok_has_subscription_bar(None));
     }
 }

@@ -70,6 +70,10 @@ struct AgentRowOwned {
 #[derive(Clone, Default)]
 struct ModelRowOwned {
     name: String,
+    req: u64,
+    input: u64,
+    output: u64,
+    cache: u64,
     tokens: u64,
     cost: f64,
 }
@@ -184,6 +188,10 @@ fn build_snapshot(
         .filter(|m| !is_synthetic_label(&m.label))
         .map(|m| ModelRowOwned {
             name: m.label.clone(),
+            req: m.tot.req,
+            input: m.tot.inp,
+            output: m.tot.out,
+            cache: m.tot.cache,
             tokens: m.tot.tokens(),
             cost: m.tot.cost,
         })
@@ -276,7 +284,17 @@ fn snapshot_to_json(snap: &ViewSnapshot, mode: &str) -> serde_json::Value {
     let models: Vec<_> = snap
         .models
         .iter()
-        .map(|m| serde_json::json!({"name": m.name, "tokens": m.tokens, "cost": m.cost}))
+        .map(|m| {
+            serde_json::json!({
+                "name": m.name,
+                "req": m.req,
+                "input": m.input,
+                "output": m.output,
+                "cache": m.cache,
+                "tokens": m.tokens,
+                "cost": m.cost,
+            })
+        })
         .collect();
     let projects: Vec<_> = snap
         .projects_tab
@@ -361,13 +379,31 @@ fn fcost(c: f64) -> String {
     }
 }
 
-fn cost_color(c: f64) -> gpui::Rgba {
-    if c < 5.0 {
-        cost_lo()
-    } else if c < 25.0 {
-        accent()
+/// Day baselines: green < $25, lime < $50, yellow < $100, orange < $200, else red.
+/// Each coarser timeframe multiplies thresholds by 4 (week×4, month×16, …).
+fn cost_scale(tf: Timeframe) -> f64 {
+    match tf {
+        Timeframe::Day => 1.0,
+        Timeframe::Week => 4.0,
+        Timeframe::Month => 16.0,
+        Timeframe::Quarter => 64.0,
+        // Unbounded history — keep quarter scale so totals don't all go red.
+        Timeframe::All => 64.0,
+    }
+}
+
+fn cost_color(c: f64, tf: Timeframe) -> gpui::Rgba {
+    let s = cost_scale(tf);
+    if c < 25.0 * s {
+        cost_lo() // green
+    } else if c < 50.0 * s {
+        rgb(0x9fd34a) // lime
+    } else if c < 100.0 * s {
+        rgb(0xf0c040) // yellow — from $50/day
+    } else if c < 200.0 * s {
+        rgb(0xf0a030) // orange
     } else {
-        cost_hi()
+        cost_hi() // red — from $200/day
     }
 }
 
@@ -968,7 +1004,7 @@ impl Dashboard {
                 ftok(s.total_tokens).into(),
                 text(),
                 fcost(s.total_cost).into(),
-                cost_color(s.total_cost),
+                cost_color(s.total_cost, s.tf),
                 "".into(),
                 muted(),
                 true,
@@ -1023,6 +1059,7 @@ impl Dashboard {
                     a.cache,
                     a.cost,
                     false,
+                    s.tf,
                 )
             }))
             .child(agent_row(
@@ -1033,6 +1070,7 @@ impl Dashboard {
                 total_cache,
                 total_cost,
                 true,
+                s.tf,
             ))
     }
 
@@ -1044,38 +1082,18 @@ impl Dashboard {
             .gap_1()
             .w_full()
             .child(section_header("BY MODEL", s.tf.label()))
-            .child(
-                div()
-                    .flex()
-                    .w_full()
-                    .font_family(MONO)
-                    .text_xs()
-                    .text_color(dim())
-                    .child(div().flex_1().child("model"))
-                    .child(div().w(px(64.)).text_right().child("tok"))
-                    .child(div().w(px(80.)).text_right().child("$")),
-            )
+            .child(agent_header_row())
             .children(s.models.iter().map(|m| {
-                div()
-                    .flex()
-                    .w_full()
-                    .font_family(MONO)
-                    .text_sm()
-                    .child(div().flex_1().text_color(text()).child(m.name.clone()))
-                    .child(
-                        div()
-                            .w(px(64.))
-                            .text_right()
-                            .text_color(text())
-                            .child(ftok(m.tokens)),
-                    )
-                    .child(
-                        div()
-                            .w(px(80.))
-                            .text_right()
-                            .text_color(cost_color(m.cost))
-                            .child(fcost(m.cost)),
-                    )
+                agent_row(
+                    &m.name,
+                    m.req,
+                    m.input,
+                    m.output,
+                    m.cache,
+                    m.cost,
+                    false,
+                    s.tf,
+                )
             }))
     }
 
@@ -1101,7 +1119,7 @@ impl Dashboard {
                         div()
                             .w(px(80.))
                             .text_right()
-                            .text_color(cost_color(p.cost))
+                            .text_color(cost_color(p.cost, self.snapshot.tf))
                             .child(fcost(p.cost)),
                     )
             }))
@@ -1123,7 +1141,7 @@ impl Dashboard {
                         div()
                             .w(px(80.))
                             .text_right()
-                            .text_color(cost_color(total.cost))
+                            .text_color(cost_color(total.cost, self.snapshot.tf))
                             .child(fcost(total.cost)),
                     ),
             )
@@ -1201,7 +1219,7 @@ impl Dashboard {
                         div()
                             .w(px(72.))
                             .text_right()
-                            .text_color(cost_color(r.cost))
+                            .text_color(cost_color(r.cost, Timeframe::Day))
                             .child(fcost(r.cost)),
                     )
             }))
@@ -1258,6 +1276,7 @@ fn agent_row(
     cache: u64,
     cost: f64,
     bold: bool,
+    tf: Timeframe,
 ) -> impl IntoElement {
     let name_s: SharedString = name.to_string().into();
     let name_color = agent_name_color(name);
@@ -1304,7 +1323,7 @@ fn agent_row(
             div()
                 .w(px(80.))
                 .text_right()
-                .text_color(cost_color(cost))
+                .text_color(cost_color(cost, tf))
                 .child(fcost(cost)),
         )
 }

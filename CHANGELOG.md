@@ -1,6 +1,10 @@
 # Changelog
 
-## [Unreleased]
+
+## 0.1.6 — 2026-07-10
+- fix: keep Grok SuperGrok weekly bar instead of TPM api 0% fallback
+- feat: show req/in/out/cache columns in BY MODEL
+- feat: scale cost colors by timeframe (yellow $50/day, red $200/day, ×4)
 
 ## 0.1.5 — 2026-07-10
 - fix: color omp (and all agents) via shared agent_name_color in BY AGENT / Rounds

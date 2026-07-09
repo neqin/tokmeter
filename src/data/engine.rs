@@ -186,7 +186,8 @@ pub fn reload_refresh_save(
         if now - checked >= limits_ttl {
             LAST_GROK_FETCH.store(now, Ordering::Relaxed);
             cache.touch_limits("grok", now);
-            if let Some(snap) = limits::fetch_grok(home, now) {
+            let prev = cache.limits.get("grok").cloned();
+            if let Some(snap) = limits::fetch_grok(home, now, prev.as_ref()) {
                 cache.set_limits("grok", snap);
             }
         }
