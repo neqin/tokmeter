@@ -1,5 +1,5 @@
 {
-  "_comment": "Тарифы за 1M токенов в USD. Источник: platform.claude.com/docs/pricing. Модель подбирается по подстроке в имени, выигрывает самое длинное совпадение (opus-4-8 раньше opus-4). Кэш считается из input через cache_multipliers (Anthropic: write_5m=1.25x, write_1h=2x, read=0.1x; у Codex cache_creation=0, read тоже 0.1x). fast — премиум-режим Claude (детектируется по usage.speed=='fast'); кэш-множители накладываются поверх fast-цены. Codex ходит через прокси zernitra — реальные ставки неизвестны; цены gpt-5.x по публичному прайсу OpenAI API на 2026-06 (cached у всего семейства = read 0.1x от input). gpt-5/codex — общий fallback для непрописанных версий; -pro не заведены (через Codex не ходят, кэш-множитель к ним неприменим). Правь под себя.",
+  "_comment": "Тарифы за 1M токенов в USD. Claude: platform.claude.com/docs/pricing. OpenAI gpt-5.x: публичный API прайс; gpt-5.6 Sol/Terra/Luna — OpenAI preview help (2026-06/07): Sol $5/$30, Terra $2.50/$15, Luna $1/$6 per 1M in/out. Подбор по подстроке, выигрывает самое длинное совпадение. cache_multipliers: Anthropic write_5m=1.25x write_1h=2x read=0.1x; у Codex/OpenAI cached input ≈ read 0.1x. fast — премиум Claude (usage.speed==fast). gpt-5/codex — fallback для непрописанных версий.",
   "cache_multipliers": { "write_5m": 1.25, "write_1h": 2.0, "read": 0.1 },
   "models": [
     { "match": "fable-5",  "input": 10.0, "output": 50.0 },
@@ -12,6 +12,9 @@
     { "match": "opus-4",   "input": 15.0, "output": 75.0 },
     { "match": "sonnet",   "input": 3.0,  "output": 15.0 },
     { "match": "haiku",    "input": 1.0,  "output": 5.0 },
+    { "match": "gpt-5.6-sol",        "input": 5.0,  "output": 30.0 },
+    { "match": "gpt-5.6-terra",      "input": 2.5,  "output": 15.0 },
+    { "match": "gpt-5.6-luna",       "input": 1.0,  "output": 6.0 },
     { "match": "gpt-5.5",            "input": 5.0,  "output": 30.0 },
     { "match": "gpt-5.4-mini",       "input": 0.75, "output": 4.5 },
     { "match": "gpt-5.4-nano",       "input": 0.2,  "output": 1.25 },

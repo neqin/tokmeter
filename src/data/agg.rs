@@ -98,7 +98,6 @@ pub struct RoundView {
 pub const ROUND_AGENTS: [&str; 3] = ["all", "claude", "codex"];
 
 pub struct Summary {
-    pub tf_label: &'static str,
     pub agents: Vec<Line>,
     pub agents_total: Tot,
     pub models: Vec<Line>,
@@ -204,7 +203,6 @@ pub fn build(
         tok / (span as f64 * 24.0)
     };
     Summary {
-        tf_label: tf.label(),
         agents,
         agents_total,
         models,

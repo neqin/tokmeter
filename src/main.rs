@@ -52,7 +52,7 @@ fn bar_colors() -> [u32; 6] {
 
 const MONO: &str = "JetBrains Mono";
 const UI_W: f32 = 560.0;
-const UI_H: f32 = 720.0;
+const UI_H: f32 = 920.0;
 const CHART_H: f32 = 140.0;
 
 // ── Owned snapshot (paint reads only this) ──────────────────────────────────
@@ -123,7 +123,6 @@ struct ViewSnapshot {
     agents: Vec<AgentRowOwned>,
     models: Vec<ModelRowOwned>,
     limits: Vec<LimitRowOwned>,
-    top_projects: Vec<ProjectRowOwned>,
     projects_tab: Vec<ProjectRowOwned>,
     projects_total: Tot,
     rounds: Vec<RoundRowOwned>,
@@ -145,7 +144,6 @@ impl Default for ViewSnapshot {
             agents: Vec::new(),
             models: Vec::new(),
             limits: Vec::new(),
-            top_projects: Vec::new(),
             projects_tab: Vec::new(),
             projects_total: Tot::default(),
             rounds: Vec::new(),
@@ -183,6 +181,7 @@ fn build_snapshot(
     let models: Vec<ModelRowOwned> = s
         .models
         .iter()
+        .filter(|m| !is_synthetic_label(&m.label))
         .map(|m| ModelRowOwned {
             name: m.label.clone(),
             tokens: m.tot.tokens(),
@@ -195,16 +194,6 @@ fn build_snapshot(
         .map(|b| ChartBar {
             label: b.label.clone(),
             tokens: b.tokens,
-        })
-        .collect();
-
-    let (top, _) = agg::projects_view(cache, pricing, tf, today, 10);
-    let top_projects: Vec<ProjectRowOwned> = top
-        .iter()
-        .map(|p| ProjectRowOwned {
-            name: p.label.clone(),
-            tokens: p.tot.tokens(),
-            cost: p.tot.cost,
         })
         .collect();
 
@@ -264,7 +253,6 @@ fn build_snapshot(
         agents,
         models,
         limits: limits_owned,
-        top_projects,
         projects_tab,
         projects_total: ptotal,
         rounds,
@@ -347,6 +335,11 @@ fn snapshot_to_json(snap: &ViewSnapshot, mode: &str) -> serde_json::Value {
 }
 
 // ── Format helpers ──────────────────────────────────────────────────────────
+
+fn is_synthetic_label(label: &str) -> bool {
+    let t = label.trim();
+    t.eq_ignore_ascii_case("<synthetic>") || t.eq_ignore_ascii_case("synthetic")
+}
 
 fn ftok(n: u64) -> String {
     if n >= 1_000_000_000 {
@@ -682,14 +675,6 @@ impl Dashboard {
             .items_center()
             .gap_2()
             .w_full()
-            .child(
-                div()
-                    .font_family(MONO)
-                    .font_weight(gpui::FontWeight::BOLD)
-                    .text_color(accent())
-                    .text_sm()
-                    .child("tok"),
-            )
             .children(Tab::ALL.into_iter().map(|tab| {
                 let is_active = tab == active;
                 let label = if is_active {
@@ -838,68 +823,84 @@ impl Dashboard {
     }
 
     fn render_metrics(&self) -> impl IntoElement {
+        // Table-like columns: label | value | rest (aligned across rows).
+        const LABEL_W: f32 = 64.0;
+        const VALUE_W: f32 = 72.0;
+
         let s = &self.snapshot;
+        let row = |label: SharedString,
+                   label_color: gpui::Rgba,
+                   value: SharedString,
+                   value_color: gpui::Rgba,
+                   rest: SharedString,
+                   rest_color: gpui::Rgba,
+                   bold: bool| {
+            div()
+                .flex()
+                .w_full()
+                .items_baseline()
+                .font_family(MONO)
+                .text_sm()
+                .font_weight(if bold {
+                    gpui::FontWeight::BOLD
+                } else {
+                    gpui::FontWeight::NORMAL
+                })
+                .child(
+                    div()
+                        .w(px(LABEL_W))
+                        .text_color(label_color)
+                        .child(label),
+                )
+                .child(
+                    div()
+                        .w(px(VALUE_W))
+                        .text_right()
+                        .text_color(value_color)
+                        .child(value),
+                )
+                .child(
+                    div()
+                        .flex_1()
+                        .pl_3()
+                        .text_color(rest_color)
+                        .child(rest),
+                )
+        };
+
         div()
             .flex()
             .flex_col()
             .gap_0p5()
-            .font_family(MONO)
-            .text_sm()
-            .child(
-                div()
-                    .flex()
-                    .gap_3()
-                    .child(
-                        div()
-                            .text_color(accent())
-                            .font_weight(gpui::FontWeight::BOLD)
-                            .child("Σ"),
-                    )
-                    .child(
-                        div()
-                            .text_color(text())
-                            .font_weight(gpui::FontWeight::BOLD)
-                            .child(ftok(s.total_tokens)),
-                    )
-                    .child(
-                        div()
-                            .text_color(cost_color(s.total_cost))
-                            .child(fcost(s.total_cost)),
-                    ),
-            )
-            .child(
-                div()
-                    .flex()
-                    .gap_2()
-                    .text_color(muted())
-                    .child(div().text_color(dim()).w(px(48.)).child("rate"))
-                    .child(
-                        div()
-                            .text_color(text())
-                            .child(ftok(s.rate_hour)),
-                    )
-                    .child(div().child("this hr ·"))
-                    .child(
-                        div()
-                            .text_color(text())
-                            .child(format!("{}/h avg", ftok(s.per_h as u64))),
-                    ),
-            )
+            .w_full()
+            .child(row(
+                "Σ".into(),
+                accent(),
+                ftok(s.total_tokens).into(),
+                text(),
+                fcost(s.total_cost).into(),
+                cost_color(s.total_cost),
+                true,
+            ))
+            .child(row(
+                "rate".into(),
+                dim(),
+                ftok(s.rate_hour).into(),
+                text(),
+                format!("this hr · {}/h avg", ftok(s.per_h as u64)).into(),
+                muted(),
+                false,
+            ))
             .when(s.rounds_known, |d| {
-                d.child(
-                    div()
-                        .flex()
-                        .gap_2()
-                        .text_color(muted())
-                        .child(div().text_color(dim()).w(px(48.)).child("rounds"))
-                        .child(div().text_color(text()).child(format!("{}", s.rounds_total)))
-                        .child(div().child("turns ·"))
-                        .child(
-                            div()
-                                .text_color(text())
-                                .child(format!("{}/turn", ftok(s.per_round as u64))),
-                        ),
-                )
+                d.child(row(
+                    "rounds".into(),
+                    dim(),
+                    format!("{}", s.rounds_total).into(),
+                    text(),
+                    format!("turns · {}/turn", ftok(s.per_round as u64)).into(),
+                    muted(),
+                    false,
+                ))
             })
     }
 
@@ -981,49 +982,6 @@ impl Dashboard {
                             .child(fcost(m.cost)),
                     )
             }))
-    }
-
-    fn render_top_projects(&self) -> impl IntoElement {
-        let rows = &self.snapshot.top_projects;
-        div()
-            .flex()
-            .flex_col()
-            .gap_1()
-            .w_full()
-            .child(section_header("TOP PROJECTS", self.snapshot.tf.label()))
-            .children(if rows.is_empty() {
-                vec![div()
-                    .font_family(MONO)
-                    .text_sm()
-                    .text_color(dim())
-                    .child("— no data —")
-                    .into_any_element()]
-            } else {
-                rows.iter()
-                    .map(|p| {
-                        div()
-                            .flex()
-                            .w_full()
-                            .font_family(MONO)
-                            .text_sm()
-                            .child(div().flex_1().text_color(text()).child(p.name.clone()))
-                            .child(
-                                div()
-                                    .w(px(64.))
-                                    .text_right()
-                                    .child(ftok(p.tokens)),
-                            )
-                            .child(
-                                div()
-                                    .w(px(80.))
-                                    .text_right()
-                                    .text_color(cost_color(p.cost))
-                                    .child(fcost(p.cost)),
-                            )
-                            .into_any_element()
-                    })
-                    .collect()
-            })
     }
 
     fn render_projects_tab(&self, cx: &mut Context<Self>) -> impl IntoElement {
@@ -1186,18 +1144,19 @@ fn section_header(title: impl Into<SharedString>, tf: impl Into<SharedString>) -
 }
 
 fn agent_header_row() -> impl IntoElement {
+    // Name flexes; metric columns share the right edge like BY MODEL.
     div()
         .flex()
         .w_full()
         .font_family(MONO)
         .text_xs()
         .text_color(dim())
-        .child(div().w(px(72.)).child(""))
+        .child(div().flex_1().child(""))
         .child(div().w(px(56.)).text_right().child("req"))
-        .child(div().w(px(56.)).text_right().child("in"))
-        .child(div().w(px(56.)).text_right().child("out"))
-        .child(div().w(px(56.)).text_right().child("cache"))
-        .child(div().flex_1().text_right().child("$"))
+        .child(div().w(px(64.)).text_right().child("in"))
+        .child(div().w(px(64.)).text_right().child("out"))
+        .child(div().w(px(64.)).text_right().child("cache"))
+        .child(div().w(px(80.)).text_right().child("$"))
 }
 
 fn agent_row(
@@ -1227,19 +1186,38 @@ fn agent_row(
         } else {
             gpui::FontWeight::NORMAL
         })
-        .child(div().w(px(72.)).text_color(name_color).child(name_s))
+        .child(div().flex_1().text_color(name_color).child(name_s))
         .child(
             div()
                 .w(px(56.))
                 .text_right()
+                .text_color(text())
                 .child(format!("{req}")),
         )
-        .child(div().w(px(56.)).text_right().child(ftok(input)))
-        .child(div().w(px(56.)).text_right().child(ftok(output)))
-        .child(div().w(px(56.)).text_right().child(ftok(cache)))
         .child(
             div()
-                .flex_1()
+                .w(px(64.))
+                .text_right()
+                .text_color(text())
+                .child(ftok(input)),
+        )
+        .child(
+            div()
+                .w(px(64.))
+                .text_right()
+                .text_color(text())
+                .child(ftok(output)),
+        )
+        .child(
+            div()
+                .w(px(64.))
+                .text_right()
+                .text_color(text())
+                .child(ftok(cache)),
+        )
+        .child(
+            div()
+                .w(px(80.))
                 .text_right()
                 .text_color(cost_color(cost))
                 .child(fcost(cost)),
@@ -1335,7 +1313,6 @@ impl Render for Dashboard {
                     .child(self.render_metrics())
                     .child(self.render_agents())
                     .child(self.render_models())
-                    .child(self.render_top_projects())
                     .into_any_element(),
                 Tab::Projects => div()
                     .id("projects-scroll")
