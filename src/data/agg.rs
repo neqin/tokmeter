@@ -34,7 +34,7 @@ pub struct Line {
 }
 
 /// Период просмотра. Окно в днях одинаково для секций и для суммы графика.
-#[derive(Clone, Copy, PartialEq)]
+#[derive(Clone, Copy, PartialEq, Debug)]
 pub enum Timeframe {
     Day,
     Week,

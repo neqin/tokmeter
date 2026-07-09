@@ -1,11 +1,10 @@
 # tokmeter
 
-GPUI prototype of the [`tok`](../tok) token-spend panel — same layout as the
-terminal UI (tabs, period pills, bar chart, BY AGENT / BY MODEL), rendered in
-a native window on Zed's GPUI engine.
+GPUI desktop token-spend panel.
 
-Demo data is hardcoded from the reference screenshot. Tabs and period pills
-are clickable; Projects/Rounds tabs are stubs.
+Same data layer (scan / cache / agg / pricing / limits), shared on-disk cache
+with `tok` (`$XDG_CACHE_HOME/tok/cache.json` or `HERDR_PLUGIN_STATE_DIR`),
+rendered in a native window on Zed's GPUI.
 
 ## Run
 
@@ -13,10 +12,36 @@ are clickable; Projects/Rounds tabs are stubs.
 cargo run
 ```
 
-Requires a Wayland or X11 display (same stack as `zed`).
+### Headless dump
 
-## Notes
+```sh
+cargo run -- --dump-json           # GLOBAL week snapshot (JSON)
+cargo run -- --dump-json=projects
+cargo run -- --dump-json=rounds
+cargo run -- --dump-json=limits
+```
 
-- GPUI pin matches `zed`: Zed rev `fca4d60…`
-- Bar chart is drawn with `canvas` + `paint_quad`
-- Tables are flex layout + mono font
+### Parity vs tok
+
+```sh
+bash scripts/parity_check.sh
+# optional: TOK_PARITY_FIXTURE=/path/to/cache.json + expected.json
+```
+
+## Layout
+
+- **Top:** subscription limits (claude / codex)
+- **Tabs:** GLOBAL (default) · Projects · Rounds (no cwd Project tab)
+- **GLOBAL:** period pills, bar chart, Σ/rate/rounds, BY AGENT, BY MODEL,
+  top-10 projects
+- **Keys:** Tab / Shift-Tab, ←/→ period or rounds agent, `r` refresh
+
+## Env (same as tok)
+
+| Var | Default |
+|-----|---------|
+| `TOK_REFRESH_SECS` | 3 |
+| `TOK_LIMITS_TTL_SECS` | 300 |
+| `TOK_WINDOW_DAYS` | 8 |
+| `TOK_HISTORY_DAYS` | 120 |
+| `XDG_CACHE_HOME` / `HERDR_PLUGIN_STATE_DIR` | cache location |
