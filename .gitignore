@@ -1,0 +1,14 @@
+
+# flow-cli
+/.worktree/
+/.flow/
+/.agents/
+.env
+.env.*
+!.env.example
+*.pid
+.DS_Store
+.codex/
+.claude/
+CLAUDE.md
+AGENTS.md
