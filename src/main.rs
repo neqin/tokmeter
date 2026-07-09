@@ -1324,11 +1324,12 @@ impl Render for Dashboard {
             })
             .child(match self.tab {
                 Tab::Global => div()
+                    .id("global-scroll")
                     .flex()
                     .flex_col()
                     .gap_3()
                     .flex_1()
-                    .overflow_hidden()
+                    .overflow_y_scroll()
                     .child(self.render_period(cx))
                     .child(self.render_chart())
                     .child(self.render_metrics())
@@ -1336,8 +1337,18 @@ impl Render for Dashboard {
                     .child(self.render_models())
                     .child(self.render_top_projects())
                     .into_any_element(),
-                Tab::Projects => self.render_projects_tab(cx).into_any_element(),
-                Tab::Rounds => self.render_rounds_tab(cx).into_any_element(),
+                Tab::Projects => div()
+                    .id("projects-scroll")
+                    .flex_1()
+                    .overflow_y_scroll()
+                    .child(self.render_projects_tab(cx))
+                    .into_any_element(),
+                Tab::Rounds => div()
+                    .id("rounds-scroll")
+                    .flex_1()
+                    .overflow_y_scroll()
+                    .child(self.render_rounds_tab(cx))
+                    .into_any_element(),
             })
             .child(
                 div()
