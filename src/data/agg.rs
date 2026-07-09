@@ -95,7 +95,7 @@ pub struct RoundView {
 }
 
 /// Сегменты селектора агента на вкладке «Раунды» (индекс 0 = без фильтра).
-pub const ROUND_AGENTS: [&str; 3] = ["all", "claude", "codex"];
+pub const ROUND_AGENTS: [&str; 4] = ["all", "claude", "codex", "omp"];
 
 pub struct Summary {
     pub agents: Vec<Line>,

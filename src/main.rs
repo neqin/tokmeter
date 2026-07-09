@@ -393,6 +393,7 @@ fn agent_name_color(agent: &str) -> gpui::Rgba {
     match agent {
         "claude" => rgb(0xf5c542),
         "codex" => accent(),
+        "omp" => rgb(0xc084fc),
         "grok" => rgb(0x63c7b2),
         _ => text(),
     }
@@ -1181,11 +1182,7 @@ impl Dashboard {
                     .child(div().w(px(72.)).text_right().child("$")),
             )
             .children(self.snapshot.rounds.iter().map(|r| {
-                let ac = if r.agent == "codex" {
-                    accent()
-                } else {
-                    rgb(0xf5c542)
-                };
+                let ac = agent_name_color(&r.agent);
                 div()
                     .flex()
                     .w_full()
@@ -1263,13 +1260,7 @@ fn agent_row(
     bold: bool,
 ) -> impl IntoElement {
     let name_s: SharedString = name.to_string().into();
-    let name_color = if name == "codex" {
-        accent()
-    } else if name == "claude" {
-        rgb(0xf5c542)
-    } else {
-        text()
-    };
+    let name_color = agent_name_color(name);
     div()
         .flex()
         .w_full()

@@ -1,4 +1,4 @@
-//! Инкрементальный разбор сессий Claude/Codex. Открываем файл только если он
+//! Инкрементальный разбор сессий Claude/Codex/OMP. Открываем файл только если он
 //! вырос; читаем лишь дописанный хвост; учитываем каждый API-запрос один раз.
 
 use super::cache::{Cache, FileState};
@@ -9,9 +9,17 @@ use std::fs::{self, File};
 use std::io::{Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
 
+#[derive(Clone, Copy)]
+enum Source {
+    Claude,
+    Codex,
+    Omp,
+}
+
 pub struct Scanner {
     claude_root: PathBuf,
     codex_root: PathBuf,
+    omp_root: PathBuf,
     min_mtime: i64,
     off: i64,      // локальное смещение для датирования
     ring_min: i64, // нижняя граница ts для кольца раундов (epoch)
@@ -22,6 +30,8 @@ impl Scanner {
         Scanner {
             claude_root: Path::new(home).join(".claude").join("projects"),
             codex_root: Path::new(home).join(".codex").join("sessions"),
+            // oh-my-pi / omp: полноценный per-turn usage в jsonl
+            omp_root: Path::new(home).join(".omp").join("agent").join("sessions"),
             min_mtime,
             off,
             ring_min,
@@ -30,13 +40,12 @@ impl Scanner {
 
     /// Подхватить новые/выросшие файлы и дописать агрегаты в кэш.
     pub fn update(&self, cache: &mut Cache) {
-        let mut files = Vec::new();
-        walk(&self.claude_root, self.min_mtime, &mut files);
-        let claude_n = files.len();
-        walk(&self.codex_root, self.min_mtime, &mut files);
+        let mut files: Vec<(PathBuf, u64, i64, Source)> = Vec::new();
+        walk(&self.claude_root, self.min_mtime, Source::Claude, &mut files);
+        walk(&self.codex_root, self.min_mtime, Source::Codex, &mut files);
+        walk(&self.omp_root, self.min_mtime, Source::Omp, &mut files);
 
-        for (i, (path, size, mtime)) in files.iter().enumerate() {
-            let is_claude = i < claude_n;
+        for (path, size, mtime, source) in &files {
             let key = path.to_string_lossy().into_owned();
             let st = cache.files.get(&key).cloned().unwrap_or_default();
             if st.size == *size && st.mtime == *mtime {
@@ -52,10 +61,10 @@ impl Scanner {
                         Ok(v) => v,
                         Err(_) => continue,
                     };
-                    if is_claude {
-                        self.claude_line(&v, path, &mut st, cache);
-                    } else {
-                        self.codex_line(&v, &mut st, cache);
+                    match source {
+                        Source::Claude => self.claude_line(&v, path, &mut st, cache),
+                        Source::Codex => self.codex_line(&v, &mut st, cache),
+                        Source::Omp => self.omp_line(&v, path, &mut st, cache),
                     }
                 }
             }
@@ -342,6 +351,186 @@ impl Scanner {
             _ => {}
         }
     }
+
+    /// OMP / oh-my-pi: `~/.omp/agent/sessions/**/*.jsonl`.
+    /// `session` → cwd; `message.role=user` → раунд; `assistant`+`usage` → токены.
+    fn omp_line(&self, o: &Value, path: &Path, st: &mut FileState, cache: &mut Cache) {
+        match o.get("type").and_then(|x| x.as_str()) {
+            Some("session") | Some("session_init") => {
+                if let Some(c) = o.get("cwd").and_then(|x| x.as_str()) {
+                    st.proj = c.to_string();
+                }
+                if let Some(m) = o.get("model").and_then(|x| x.as_str()) {
+                    st.model = m.to_string();
+                }
+            }
+            Some("message") => {
+                let msg = &o["message"];
+                match msg.get("role").and_then(|x| x.as_str()) {
+                    Some("user") => self.omp_round(o, path, st, cache),
+                    Some("assistant") => self.omp_usage(o, path, st, cache),
+                    _ => {}
+                }
+            }
+            Some("model_change") => {
+                if let Some(m) = o
+                    .get("model")
+                    .or_else(|| o.get("to"))
+                    .and_then(|x| x.as_str())
+                {
+                    st.model = m.to_string();
+                }
+            }
+            _ => {}
+        }
+    }
+
+    fn omp_usage(&self, o: &Value, path: &Path, st: &mut FileState, cache: &mut Cache) {
+        let msg = &o["message"];
+        let usage = &msg["usage"];
+        if !usage.is_object() {
+            return;
+        }
+        let mid = match o.get("id").and_then(|x| x.as_str()) {
+            Some(s) => s,
+            None => return,
+        };
+        if mid == st.msgid {
+            return;
+        }
+        st.msgid = mid.to_string();
+
+        let u = |k: &str| usage.get(k).and_then(|x| x.as_u64()).unwrap_or(0);
+        let inp = u("input");
+        let cread = u("cacheRead");
+        // OMP отдаёт один cacheWrite — кладём в 5m-слот (pricing write_5m).
+        let cw5 = u("cacheWrite");
+        let out = u("output");
+        // Нет токенов — не считаем пустой ход (стриминг-черновик и т.п.).
+        if inp + cread + cw5 + out == 0 {
+            return;
+        }
+
+        let model = msg
+            .get("model")
+            .and_then(|x| x.as_str())
+            .or_else(|| {
+                if st.model.is_empty() {
+                    None
+                } else {
+                    Some(st.model.as_str())
+                }
+            })
+            .unwrap_or("unknown");
+        let date = match o
+            .get("timestamp")
+            .and_then(|x| x.as_str())
+            .and_then(|t| self.date_of(t))
+        {
+            Some(d) => d,
+            None => return,
+        };
+        let project = if st.proj.is_empty() {
+            omp_project_fallback(path)
+        } else {
+            st.proj.clone()
+        };
+
+        cache.add(
+            &date, "omp", model, "standard", &project, inp, cread, cw5, 0, out,
+        );
+        if let Some(hour) = o
+            .get("timestamp")
+            .and_then(|x| x.as_str())
+            .and_then(|t| self.hour_of(t))
+        {
+            cache.add_hour_tokens(&hour, "omp", &project, inp + cread + cw5 + out);
+        }
+        if st.r_ts != 0 {
+            st.r_in += inp;
+            st.r_cread += cread;
+            st.r_cw5 += cw5;
+            st.r_out += out;
+            st.r_model = model.to_string();
+            st.r_speed = "standard".to_string();
+        }
+    }
+
+    fn omp_round(&self, o: &Value, path: &Path, st: &mut FileState, cache: &mut Cache) {
+        let msg = &o["message"];
+        let mid = match o.get("id").and_then(|x| x.as_str()) {
+            Some(s) => s,
+            None => return,
+        };
+        // Дедуп по id user-сообщения (аналог promptId у Claude).
+        if mid == st.last_pid {
+            return;
+        }
+        let text = content_text(&msg["content"]);
+        let t = text.trim();
+        if t.is_empty() || t.starts_with('<') {
+            return;
+        }
+        st.last_pid = mid.to_string();
+        cache.flush_round(st, "omp", self.ring_min);
+        let hour = match o
+            .get("timestamp")
+            .and_then(|x| x.as_str())
+            .and_then(|s| self.hour_of(s))
+        {
+            Some(h) => h,
+            None => return,
+        };
+        let project = if st.proj.is_empty() {
+            omp_project_fallback(path)
+        } else {
+            st.proj.clone()
+        };
+        st.r_ts = o
+            .get("timestamp")
+            .and_then(|x| x.as_str())
+            .and_then(parse_epoch)
+            .unwrap_or(0);
+        st.r_proj = project.clone();
+        cache.add_round(&hour, "omp", &project);
+    }
+}
+
+/// Текст user-сообщения OMP (string или content-blocks).
+fn content_text(content: &Value) -> String {
+    if let Some(s) = content.as_str() {
+        return s.to_string();
+    }
+    if let Some(arr) = content.as_array() {
+        return arr
+            .iter()
+            .find_map(|b| {
+                if b.get("type").and_then(|x| x.as_str()) == Some("text") {
+                    b.get("text").and_then(|x| x.as_str())
+                } else {
+                    None
+                }
+            })
+            .unwrap_or("")
+            .to_string();
+    }
+    String::new()
+}
+
+/// Путь вида `.../sessions/-proj-tools-telvault/….jsonl` → `/proj/tools/telvault`.
+fn omp_project_fallback(path: &Path) -> String {
+    path.parent()
+        .and_then(|p| p.file_name())
+        .map(|n| {
+            let s = n.to_string_lossy();
+            if s.starts_with('-') {
+                s.replacen('-', "/", 1).replace('-', "/")
+            } else {
+                s.replace('-', "/")
+            }
+        })
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(|| "unknown".to_string())
 }
 
 /// Прочитать дописанный хвост [offset..size], вернуть его до последнего '\n'
@@ -367,8 +556,8 @@ fn decode_folder(path: &Path) -> String {
         .unwrap_or_default()
 }
 
-/// Рекурсивно собрать *.jsonl с mtime >= min_mtime: (путь, размер, mtime).
-fn walk(root: &Path, min_mtime: i64, out: &mut Vec<(PathBuf, u64, i64)>) {
+/// Рекурсивно собрать *.jsonl с mtime >= min_mtime.
+fn walk(root: &Path, min_mtime: i64, source: Source, out: &mut Vec<(PathBuf, u64, i64, Source)>) {
     let rd = match fs::read_dir(root) {
         Ok(r) => r,
         Err(_) => return,
@@ -380,12 +569,12 @@ fn walk(root: &Path, min_mtime: i64, out: &mut Vec<(PathBuf, u64, i64)>) {
             Err(_) => continue,
         };
         if ft.is_dir() {
-            walk(&p, min_mtime, out);
+            walk(&p, min_mtime, source, out);
         } else if p.extension().map_or(false, |x| x == "jsonl") {
             if let Ok(md) = e.metadata() {
                 let mt = mtime_secs(&md);
                 if mt >= min_mtime {
-                    out.push((p, md.len(), mt));
+                    out.push((p, md.len(), mt, source));
                 }
             }
         }
@@ -398,4 +587,87 @@ fn mtime_secs(md: &fs::Metadata) -> i64 {
         .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
         .map(|d| d.as_secs() as i64)
         .unwrap_or(0)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use super::super::cache::Cache;
+    use std::io::Write;
+
+    #[test]
+    fn content_text_from_blocks() {
+        let v: Value = serde_json::json!([
+            {"type": "text", "text": "hello omp"},
+            {"type": "image", "url": "x"}
+        ]);
+        assert_eq!(content_text(&v), "hello omp");
+        assert_eq!(content_text(&Value::String("plain".into())), "plain");
+    }
+
+    #[test]
+    fn omp_project_fallback_decodes_session_dir() {
+        let p = Path::new("/home/u/.omp/agent/sessions/-proj-tools-telvault/s.jsonl");
+        assert_eq!(omp_project_fallback(p), "/proj/tools/telvault");
+    }
+
+    #[test]
+    fn scans_omp_session_usage_and_rounds() {
+        let dir = std::env::temp_dir().join(format!(
+            "tokmeter-omp-scan-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let sess = dir.join(".omp").join("agent").join("sessions").join("-tmp");
+        fs::create_dir_all(&sess).unwrap();
+        let path = sess.join("session.jsonl");
+        let mut f = fs::File::create(&path).unwrap();
+        writeln!(
+            f,
+            r#"{{"type":"session","id":"s1","timestamp":"2026-07-08T12:00:00.000Z","cwd":"/tmp/demo"}}"#
+        )
+        .unwrap();
+        writeln!(
+            f,
+            r#"{{"type":"message","id":"u1","timestamp":"2026-07-08T12:00:01.000Z","message":{{"role":"user","content":[{{"type":"text","text":"hi"}}]}}}}"#
+        )
+        .unwrap();
+        writeln!(
+            f,
+            r#"{{"type":"message","id":"a1","timestamp":"2026-07-08T12:00:02.000Z","message":{{"role":"assistant","model":"gpt-5.5","usage":{{"input":100,"output":20,"cacheRead":50,"cacheWrite":0,"totalTokens":170}}}}}}"#
+        )
+        .unwrap();
+        // duplicate id — must not double-count
+        writeln!(
+            f,
+            r#"{{"type":"message","id":"a1","timestamp":"2026-07-08T12:00:02.000Z","message":{{"role":"assistant","model":"gpt-5.5","usage":{{"input":100,"output":20,"cacheRead":50,"cacheWrite":0,"totalTokens":170}}}}}}"#
+        )
+        .unwrap();
+
+        let mut cache = Cache::load(dir.join("cache.json"));
+        let scanner = Scanner::new(dir.to_str().unwrap(), 0, 0, 0);
+        scanner.update(&mut cache);
+
+        let mut found = false;
+        for (k, c) in &cache.agg {
+            if k.contains("omp") && k.contains("gpt-5.5") {
+                // [req, input, cache_read, cw5, cw1h, output]
+                assert_eq!(c[0], 1, "req");
+                assert_eq!(c[1], 100, "input");
+                assert_eq!(c[2], 50, "cache_read");
+                assert_eq!(c[5], 20, "output");
+                assert!(k.contains("/tmp/demo"), "project in key: {k}");
+                found = true;
+            }
+        }
+        assert!(found, "omp aggregate missing: {:?}", cache.agg.keys().collect::<Vec<_>>());
+        assert!(
+            cache.hours.values().any(|h| h[1] >= 1),
+            "expected at least one round in hours"
+        );
+
+        let _ = fs::remove_dir_all(&dir);
+    }
 }

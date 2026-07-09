@@ -1,0 +1,18 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 128 128" width="128" height="128">
+  <!-- Dark rounded tile -->
+  <rect x="4" y="4" width="120" height="120" rx="28" fill="#121216"/>
+  <rect x="4" y="4" width="120" height="120" rx="28" fill="none" stroke="#2a2a32" stroke-width="3"/>
+  <!-- Soft glow -->
+  <circle cx="64" cy="58" r="38" fill="#f0a030" opacity="0.12"/>
+  <!-- Token / coin -->
+  <circle cx="64" cy="52" r="30" fill="#f0a030"/>
+  <circle cx="64" cy="52" r="24" fill="none" stroke="#1a1208" stroke-width="3" opacity="0.35"/>
+  <text x="64" y="60" text-anchor="middle" font-family="DejaVu Sans, sans-serif"
+        font-size="28" font-weight="700" fill="#1a1208">Σ</text>
+  <!-- Mini usage bars -->
+  <rect x="28" y="94" width="16" height="14" rx="3" fill="#3dd68c"/>
+  <rect x="50" y="88" width="16" height="20" rx="3" fill="#f0c040"/>
+  <rect x="72" y="82" width="16" height="26" rx="3" fill="#f0a030"/>
+  <rect x="94" y="90" width="16" height="18" rx="3" fill="#ff5c5c"/>
+</svg>

@@ -1,5 +1,5 @@
 {
-  "_comment": "Тарифы за 1M токенов в USD. Claude: platform.claude.com/docs/pricing. OpenAI gpt-5.x: публичный API прайс; gpt-5.6 Sol/Terra/Luna — OpenAI preview help (2026-06/07): Sol $5/$30, Terra $2.50/$15, Luna $1/$6 per 1M in/out. Подбор по подстроке, выигрывает самое длинное совпадение. cache_multipliers: Anthropic write_5m=1.25x write_1h=2x read=0.1x; у Codex/OpenAI cached input ≈ read 0.1x. fast — премиум Claude (usage.speed==fast). gpt-5/codex — fallback для непрописанных версий.",
+  "_comment": "Тарифы за 1M токенов в USD. Claude: platform.claude.com/docs/pricing. OpenAI gpt-5.x: публичный API прайс; gpt-5.6 Sol/Terra/Luna — OpenAI preview help (2026-06/07): Sol $5/$30, Terra $2.50/$15, Luna $1/$6 per 1M in/out. Gemini: ai.google.dev/gemini-api/docs/pricing (3.5 Flash $1.50/$9, 3.1 Flash-Lite $0.25/$1.50, 3 Flash $0.50/$3, 3.1 Pro $2/$12 text). Подбор по подстроке, выигрывает самое длинное совпадение. cache_multipliers: Anthropic write_5m=1.25x write_1h=2x read=0.1x; у Codex/OpenAI/Gemini cached input ≈ read 0.1x. fast — премиум Claude (usage.speed==fast). gpt-5/codex — fallback для непрописанных версий.",
   "cache_multipliers": { "write_5m": 1.25, "write_1h": 2.0, "read": 0.1 },
   "models": [
     { "match": "fable-5",  "input": 10.0, "output": 50.0 },
@@ -25,7 +25,12 @@
     { "match": "gpt-5.1-codex-max",  "input": 1.25, "output": 10.0 },
     { "match": "gpt-5.1-codex",      "input": 1.25, "output": 10.0 },
     { "match": "gpt-5",    "input": 1.25, "output": 10.0 },
-    { "match": "codex",    "input": 1.25, "output": 10.0 }
+    { "match": "codex",    "input": 1.25, "output": 10.0 },
+    { "match": "gemini-3.5-flash",       "input": 1.5,  "output": 9.0 },
+    { "match": "gemini-3.1-flash-lite",  "input": 0.25, "output": 1.5 },
+    { "match": "gemini-3.1-pro",         "input": 2.0,  "output": 12.0 },
+    { "match": "gemini-3-flash",         "input": 0.5,  "output": 3.0 },
+    { "match": "gemini-3-pro",           "input": 2.0,  "output": 12.0 }
   ],
   "default": { "input": 3.0, "output": 15.0 }
 }

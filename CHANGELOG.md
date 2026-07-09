@@ -2,6 +2,13 @@
 
 ## [Unreleased]
 
+## 0.1.5 — 2026-07-10
+- fix: color omp (and all agents) via shared agent_name_color in BY AGENT / Rounds
+
+## 0.1.4 — 2026-07-10
+- feat: scan oh-my-pi (`omp`) sessions for tokens, cost, and rounds
+- feat: Gemini 3.x pricing rates (3.5 Flash, 3.1 Flash-Lite, 3.1 Pro, 3 Flash)
+
 ## 0.1.3 — 2026-07-09
 - feat: compact limit bars with green-to-red fill
 - feat: Grok weekly usage via `_x.ai/billing` ACP RPC
