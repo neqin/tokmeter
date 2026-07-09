@@ -1,0 +1,12 @@
+[Desktop Entry]
+Type=Application
+Version=1.0
+Name=tokmeter
+GenericName=Token usage meter
+Comment=Claude / Codex / Grok token spend dashboard
+Exec=tokmeter
+Icon=utilities-system-monitor
+Terminal=false
+Categories=Utility;Monitor;Development;
+StartupNotify=true
+Keywords=tokens;usage;claude;codex;grok;

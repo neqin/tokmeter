@@ -11,10 +11,10 @@ use data::timeutil::{
     clock, local_day, local_offset, now_epoch, secs_into_local_day, ymd_hour_str,
 };
 use gpui::{
-    actions, canvas, div, fill, point, prelude::*, px, rgb, size, App, AppContext, Bounds, Context,
-    FocusHandle, Focusable, InteractiveElement, KeyBinding, ParentElement, Pixels, SharedString,
-    StatefulInteractiveElement, Styled, Window, WindowBackgroundAppearance, WindowBounds,
-    WindowOptions,
+    actions, canvas, div, fill, point, prelude::*, px, relative, rgb, size, AnyElement, App,
+    AppContext, Bounds, Context, FocusHandle, Focusable, InteractiveElement, KeyBinding,
+    ParentElement, Pixels, SharedString, StatefulInteractiveElement, Styled, Window,
+    WindowBackgroundAppearance, WindowBounds, WindowOptions,
 };
 use gpui_platform::application;
 use std::env;
@@ -378,13 +378,23 @@ fn bar_color(level: f32) -> gpui::Rgba {
     rgb(colors[i])
 }
 
-fn pct_color(p: f64) -> gpui::Rgba {
-    if p < 60.0 {
-        cost_lo()
-    } else if p < 85.0 {
-        accent()
-    } else {
-        cost_hi()
+/// Usage bar fill: green (low) → yellow → orange → red (high).
+fn usage_fill_color(pct: f64) -> gpui::Rgba {
+    match pct {
+        p if p < 35.0 => rgb(0x3dd68c), // green
+        p if p < 55.0 => rgb(0x9fd34a), // lime
+        p if p < 70.0 => rgb(0xf0c040), // yellow
+        p if p < 85.0 => rgb(0xf0a030), // orange
+        _ => rgb(0xff5c5c),             // red
+    }
+}
+
+fn agent_name_color(agent: &str) -> gpui::Rgba {
+    match agent {
+        "claude" => rgb(0xf5c542),
+        "codex" => accent(),
+        "grok" => rgb(0x63c7b2),
+        _ => text(),
     }
 }
 
@@ -401,7 +411,7 @@ impl Tab {
     const ALL: [Tab; 3] = [Tab::Global, Tab::Projects, Tab::Rounds];
     fn label(self) -> &'static str {
         match self {
-            Tab::Global => "GLOBAL",
+            Tab::Global => "Usage",
             Tab::Projects => "Projects",
             Tab::Rounds => "Rounds",
         }
@@ -622,46 +632,115 @@ impl Focusable for Dashboard {
 
 impl Dashboard {
     fn render_limits(&self) -> impl IntoElement {
+        // Name column fixed (longest label + pad); bars share remaining width equally.
+        const BAR_H: f32 = 7.0;
+        const NAME_CHAR: f32 = 7.5;
+        const NAME_PAD: f32 = 12.0;
         let rows = &self.snapshot.limits;
+        let name_w = rows
+            .iter()
+            .map(|r| r.agent.chars().count())
+            .max()
+            .unwrap_or(6) as f32
+            * NAME_CHAR
+            + NAME_PAD;
+
         div()
             .flex()
-            .flex_wrap()
-            .gap_3()
+            .flex_col()
+            .gap_1()
             .w_full()
             .font_family(MONO)
-            .text_xs()
             .children(if rows.is_empty() {
                 vec![div()
+                    .text_xs()
                     .text_color(dim())
                     .child("limits —")
                     .into_any_element()]
             } else {
                 rows.iter()
                     .map(|r| {
-                        let wins = if r.windows.is_empty() {
-                            "—".to_string()
+                        let name = r.agent.clone();
+                        let name_color = agent_name_color(&name);
+                        let bars: Vec<AnyElement> = if r.windows.is_empty() {
+                            vec![div()
+                                .flex_1()
+                                .text_xs()
+                                .text_color(dim())
+                                .child("—")
+                                .into_any_element()]
                         } else {
                             r.windows
                                 .iter()
-                                .map(|w| format!("{} {:.0}%", w.label, w.pct))
-                                .collect::<Vec<_>>()
-                                .join(" · ")
+                                .map(|w| {
+                                    let pct = w.pct.clamp(0.0, 100.0);
+                                    let fill = usage_fill_color(pct);
+                                    // relative fill of full-width track
+                                    let frac = (pct as f32 / 100.0).clamp(0.0, 1.0);
+                                    div()
+                                        .flex()
+                                        .flex_col()
+                                        .flex_1()
+                                        .min_w(px(48.))
+                                        .gap_0p5()
+                                        .child(
+                                            div()
+                                                .flex()
+                                                .items_baseline()
+                                                .gap_1()
+                                                .text_xs()
+                                                .child(
+                                                    div()
+                                                        .text_color(dim())
+                                                        .child(w.label.clone()),
+                                                )
+                                                .child(
+                                                    div()
+                                                        .text_color(fill)
+                                                        .child(format!("{pct:.0}%")),
+                                                ),
+                                        )
+                                        .child(
+                                            div()
+                                                .w_full()
+                                                .h(px(BAR_H))
+                                                .rounded(px(3.0))
+                                                .bg(rgb(0x2a2a32))
+                                                .overflow_hidden()
+                                                .child(
+                                                    div()
+                                                        .h_full()
+                                                        .rounded(px(3.0))
+                                                        .bg(fill)
+                                                        .w(relative(frac)),
+                                                ),
+                                        )
+                                        .into_any_element()
+                                })
+                                .collect()
                         };
-                        let color = r
-                            .windows
-                            .iter()
-                            .map(|w| w.pct)
-                            .fold(0.0_f64, f64::max);
                         div()
                             .flex()
-                            .gap_1()
+                            .items_end()
+                            .gap_2()
+                            .w_full()
                             .child(
                                 div()
-                                    .text_color(accent())
+                                    .w(px(name_w))
+                                    .flex_shrink_0()
+                                    .text_xs()
                                     .font_weight(gpui::FontWeight::BOLD)
-                                    .child(r.agent.clone()),
+                                    .text_color(name_color)
+                                    .child(name),
                             )
-                            .child(div().text_color(pct_color(color)).child(wins))
+                            .child(
+                                div()
+                                    .flex()
+                                    .flex_1()
+                                    .gap_2()
+                                    .min_w(px(0.))
+                                    .children(bars),
+                            )
                             .into_any_element()
                     })
                     .collect()
@@ -823,17 +902,24 @@ impl Dashboard {
     }
 
     fn render_metrics(&self) -> impl IntoElement {
-        // Table-like columns: label | value | rest (aligned across rows).
-        const LABEL_W: f32 = 64.0;
-        const VALUE_W: f32 = 72.0;
+        // A left | B right | C left | D left
+        // Σ      4.7B   $4078.52
+        // rate   4.1M   this hr     28.1M/h avg
+        // rounds 2064   turns       2.3M/turn
+        const A: f32 = 64.0;
+        const B: f32 = 72.0;
+        const C: f32 = 96.0;
+        const D: f32 = 104.0;
 
         let s = &self.snapshot;
-        let row = |label: SharedString,
-                   label_color: gpui::Rgba,
-                   value: SharedString,
-                   value_color: gpui::Rgba,
-                   rest: SharedString,
-                   rest_color: gpui::Rgba,
+        let row = |a: SharedString,
+                   a_color: gpui::Rgba,
+                   b: SharedString,
+                   b_color: gpui::Rgba,
+                   c: SharedString,
+                   c_color: gpui::Rgba,
+                   d: SharedString,
+                   d_color: gpui::Rgba,
                    bold: bool| {
             div()
                 .flex()
@@ -846,25 +932,27 @@ impl Dashboard {
                 } else {
                     gpui::FontWeight::NORMAL
                 })
+                .child(div().w(px(A)).text_color(a_color).child(a))
                 .child(
                     div()
-                        .w(px(LABEL_W))
-                        .text_color(label_color)
-                        .child(label),
-                )
-                .child(
-                    div()
-                        .w(px(VALUE_W))
+                        .w(px(B))
                         .text_right()
-                        .text_color(value_color)
-                        .child(value),
+                        .text_color(b_color)
+                        .child(b),
                 )
                 .child(
                     div()
-                        .flex_1()
+                        .w(px(C))
                         .pl_3()
-                        .text_color(rest_color)
-                        .child(rest),
+                        .text_color(c_color)
+                        .child(c),
+                )
+                .child(
+                    div()
+                        .w(px(D))
+                        .pl_2()
+                        .text_color(d_color)
+                        .child(d),
                 )
         };
 
@@ -880,6 +968,8 @@ impl Dashboard {
                 text(),
                 fcost(s.total_cost).into(),
                 cost_color(s.total_cost),
+                "".into(),
+                muted(),
                 true,
             ))
             .child(row(
@@ -887,8 +977,10 @@ impl Dashboard {
                 dim(),
                 ftok(s.rate_hour).into(),
                 text(),
-                format!("this hr · {}/h avg", ftok(s.per_h as u64)).into(),
+                "this hr".into(),
                 muted(),
+                format!("{}/h avg", ftok(s.per_h as u64)).into(),
+                text(),
                 false,
             ))
             .when(s.rounds_known, |d| {
@@ -897,8 +989,10 @@ impl Dashboard {
                     dim(),
                     format!("{}", s.rounds_total).into(),
                     text(),
-                    format!("turns · {}/turn", ftok(s.per_round as u64)).into(),
+                    "turns".into(),
                     muted(),
+                    format!("{}/turn", ftok(s.per_round as u64)).into(),
+                    text(),
                     false,
                 ))
             })

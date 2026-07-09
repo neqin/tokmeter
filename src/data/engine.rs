@@ -152,6 +152,7 @@ pub fn reload_refresh_save(
     if limits_ttl > 0 {
         static LAST_CLAUDE_FETCH: AtomicI64 = AtomicI64::new(0);
         static LAST_CODEX_FETCH: AtomicI64 = AtomicI64::new(0);
+        static LAST_GROK_FETCH: AtomicI64 = AtomicI64::new(0);
         let now = now_epoch();
         let checked = cache
             .limits
@@ -175,6 +176,18 @@ pub fn reload_refresh_save(
             cache.touch_limits("codex", now);
             if let Some(snap) = limits::fetch_codex(home, now) {
                 cache.set_limits("codex", snap);
+            }
+        }
+        let checked = cache
+            .limits
+            .get("grok")
+            .map_or(0, |s| s.checked)
+            .max(LAST_GROK_FETCH.load(Ordering::Relaxed));
+        if now - checked >= limits_ttl {
+            LAST_GROK_FETCH.store(now, Ordering::Relaxed);
+            cache.touch_limits("grok", now);
+            if let Some(snap) = limits::fetch_grok(home, now) {
+                cache.set_limits("grok", snap);
             }
         }
     }

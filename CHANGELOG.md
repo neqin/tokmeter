@@ -2,6 +2,11 @@
 
 ## [Unreleased]
 
+## 0.1.3 — 2026-07-09
+- feat: compact limit bars with green-to-red fill
+- feat: Grok weekly usage via `_x.ai/billing` ACP RPC
+- fix: stretch limit bars across window; rename GLOBAL to Usage
+
 ## 0.1.2 — 2026-07-09
 - fix: polish GLOBAL layout, metrics table, and agent columns
 - fix: hide synthetic model rows and drop top projects from GLOBAL
