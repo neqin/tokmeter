@@ -89,6 +89,7 @@ struct ProjectRowOwned {
 struct RoundRowOwned {
     time: String,
     agent: String,
+    model: String,
     project: String,
     tokens: u64,
     cost: f64,
@@ -225,6 +226,7 @@ fn build_snapshot(
         .map(|r| RoundRowOwned {
             time: r.time,
             agent: r.agent,
+            model: r.model,
             project: r.project,
             tokens: r.tokens,
             cost: r.cost,
@@ -306,7 +308,7 @@ fn snapshot_to_json(snap: &ViewSnapshot, mode: &str) -> serde_json::Value {
         .iter()
         .map(|r| {
             serde_json::json!({
-                "time": r.time, "agent": r.agent, "project": r.project,
+                "time": r.time, "agent": r.agent, "model": r.model, "project": r.project,
                 "tokens": r.tokens, "cost": r.cost
             })
         })
@@ -1194,10 +1196,11 @@ impl Dashboard {
                     .text_xs()
                     .text_color(dim())
                     .child(div().w(px(48.)).child("time"))
-                    .child(div().w(px(64.)).child("agent"))
+                    .child(div().w(px(56.)).child("agent"))
+                    .child(div().w(px(120.)).child("model"))
                     .child(div().flex_1().child("project"))
                     .child(div().w(px(56.)).text_right().child("tok"))
-                    .child(div().w(px(72.)).text_right().child("$")),
+                    .child(div().w(px(64.)).text_right().child("$")),
             )
             .children(self.snapshot.rounds.iter().map(|r| {
                 let ac = agent_name_color(&r.agent);
@@ -1207,7 +1210,14 @@ impl Dashboard {
                     .font_family(MONO)
                     .text_sm()
                     .child(div().w(px(48.)).text_color(dim()).child(r.time.clone()))
-                    .child(div().w(px(64.)).text_color(ac).child(r.agent.clone()))
+                    .child(div().w(px(56.)).text_color(ac).child(r.agent.clone()))
+                    .child(
+                        div()
+                            .w(px(120.))
+                            .text_color(muted())
+                            .overflow_hidden()
+                            .child(r.model.clone()),
+                    )
                     .child(div().flex_1().text_color(text()).child(r.project.clone()))
                     .child(
                         div()
@@ -1217,7 +1227,7 @@ impl Dashboard {
                     )
                     .child(
                         div()
-                            .w(px(72.))
+                            .w(px(64.))
                             .text_right()
                             .text_color(cost_color(r.cost, Timeframe::Day))
                             .child(fcost(r.cost)),

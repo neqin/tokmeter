@@ -1,6 +1,9 @@
 # Changelog
 
 
+## 0.1.7 — 2026-07-10
+- feat: show model column in Rounds view and --dump-json
+
 ## 0.1.6 — 2026-07-10
 - fix: keep Grok SuperGrok weekly bar instead of TPM api 0% fallback
 - feat: show req/in/out/cache columns in BY MODEL

@@ -89,6 +89,7 @@ pub struct Bucket {
 pub struct RoundView {
     pub time: String,
     pub agent: String,
+    pub model: String,
     pub project: String,
     pub tokens: u64,
     pub cost: f64,
@@ -235,6 +236,7 @@ pub fn rounds_view(
         .map(|r| RoundView {
             time: hm(r.ts, off),
             agent: r.agent.clone(),
+            model: r.model.clone(),
             project: short_path(&r.project),
             tokens: r.inp + r.cread + r.cw5 + r.cw1h + r.out,
             cost: pricing.cost(&r.model, &r.speed, r.inp, r.cread, r.cw5, r.cw1h, r.out),
