@@ -232,8 +232,28 @@ impl Scanner {
     fn codex_line(&self, o: &Value, st: &mut FileState, cache: &mut Cache) {
         let t = o.get("type").and_then(|x| x.as_str()).unwrap_or("");
         let p = &o["payload"];
+        if st.codex_replay {
+            if t == "inter_agent_communication_metadata" {
+                st.codex_replay = false;
+                st.codex_parent.clear();
+                st.ptotal = 0;
+            }
+            return;
+        }
         match t {
             "session_meta" => {
+                let id = p.get("id").and_then(|x| x.as_str()).unwrap_or("");
+                if !st.codex_parent.is_empty() && id == st.codex_parent {
+                    st.codex_replay = true;
+                    return;
+                }
+                if st.codex_parent.is_empty() {
+                    st.codex_parent = p
+                        .pointer("/source/subagent/thread_spawn/parent_thread_id")
+                        .and_then(|x| x.as_str())
+                        .unwrap_or("")
+                        .to_string();
+                }
                 if let Some(c) = p.get("cwd").and_then(|x| x.as_str()) {
                     st.proj = c.to_string();
                 }
@@ -667,6 +687,106 @@ mod tests {
             cache.hours.values().any(|h| h[1] >= 1),
             "expected at least one round in hours"
         );
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn skips_inherited_codex_subagent_history() {
+        let dir = std::env::temp_dir().join(format!(
+            "tokmeter-codex-subagent-scan-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let sessions = dir
+            .join(".codex")
+            .join("sessions")
+            .join("2026")
+            .join("07")
+            .join("11");
+        fs::create_dir_all(&sessions).unwrap();
+        let child = sessions.join("child.jsonl");
+        let mut f = fs::File::create(&child).unwrap();
+        writeln!(
+            f,
+            r#"{{"timestamp":"2026-07-11T12:00:00Z","type":"session_meta","payload":{{"id":"child","cwd":"/tmp/demo","source":{{"subagent":{{"thread_spawn":{{"parent_thread_id":"parent"}}}}}}}}}}"#
+        )
+        .unwrap();
+
+        let state = dir.join("cache.json");
+        let scanner = Scanner::new(dir.to_str().unwrap(), 0, 0, 0);
+        let mut cache = Cache::load(state.clone());
+        scanner.update(&mut cache);
+        cache.save();
+
+        let parent = sessions.join("parent.jsonl");
+        let mut p = fs::File::create(parent).unwrap();
+        writeln!(
+            p,
+            r#"{{"timestamp":"2026-07-11T11:00:00Z","type":"session_meta","payload":{{"id":"parent","cwd":"/tmp/demo","model":"gpt-5.6-sol","source":"cli"}}}}"#
+        )
+        .unwrap();
+        writeln!(
+            p,
+            r#"{{"timestamp":"2026-07-11T11:00:01Z","type":"event_msg","payload":{{"type":"user_message","message":"parent"}}}}"#
+        )
+        .unwrap();
+        writeln!(
+            p,
+            r#"{{"timestamp":"2026-07-11T11:00:02Z","type":"event_msg","payload":{{"type":"token_count","info":{{"total_token_usage":{{"total_tokens":110}},"last_token_usage":{{"input_tokens":100,"cached_input_tokens":80,"output_tokens":10}}}}}}}}"#
+        )
+        .unwrap();
+
+        let mut f = fs::OpenOptions::new().append(true).open(child).unwrap();
+        writeln!(
+            f,
+            r#"{{"timestamp":"2026-07-11T12:00:00Z","type":"session_meta","payload":{{"id":"parent","cwd":"/tmp/demo","source":"cli"}}}}"#
+        )
+        .unwrap();
+        writeln!(
+            f,
+            r#"{{"timestamp":"2026-07-11T12:00:00Z","type":"event_msg","payload":{{"type":"user_message","message":"inherited"}}}}"#
+        )
+        .unwrap();
+        writeln!(
+            f,
+            r#"{{"timestamp":"2026-07-11T12:00:00Z","type":"event_msg","payload":{{"type":"token_count","info":{{"total_token_usage":{{"total_tokens":110}},"last_token_usage":{{"input_tokens":100,"cached_input_tokens":80,"output_tokens":10}}}}}}}}"#
+        )
+        .unwrap();
+        writeln!(
+            f,
+            r#"{{"timestamp":"2026-07-11T12:00:01Z","type":"inter_agent_communication_metadata","payload":{{}}}}"#
+        )
+        .unwrap();
+        writeln!(
+            f,
+            r#"{{"timestamp":"2026-07-11T12:00:02Z","type":"turn_context","payload":{{"cwd":"/tmp/demo","model":"gpt-5.6-sol"}}}}"#
+        )
+        .unwrap();
+        writeln!(
+            f,
+            r#"{{"timestamp":"2026-07-11T12:00:03Z","type":"event_msg","payload":{{"type":"user_message","message":"child"}}}}"#
+        )
+        .unwrap();
+        writeln!(
+            f,
+            r#"{{"timestamp":"2026-07-11T12:00:04Z","type":"event_msg","payload":{{"type":"token_count","info":{{"total_token_usage":{{"total_tokens":150}},"last_token_usage":{{"input_tokens":30,"cached_input_tokens":20,"output_tokens":10}}}}}}}}"#
+        )
+        .unwrap();
+
+        let mut cache = Cache::load(state);
+        scanner.update(&mut cache);
+
+        let counts = cache.agg.values().fold([0u64; 6], |mut total, counts| {
+            for i in 0..6 {
+                total[i] += counts[i];
+            }
+            total
+        });
+        assert_eq!(counts, [2, 30, 100, 0, 0, 20]);
+        assert_eq!(cache.hours.values().map(|h| h[1]).sum::<u64>(), 2);
 
         let _ = fs::remove_dir_all(&dir);
     }

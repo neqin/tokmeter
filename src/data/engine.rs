@@ -269,7 +269,10 @@ mod tests {
         assert!(text.len() > 2, "cache not truncated");
         let v: serde_json::Value = serde_json::from_str(&text).expect("valid json");
         assert!(v.is_object());
-        assert_eq!(v.get("version").and_then(|x| x.as_u64()), Some(3));
+        assert_eq!(
+            v.get("version").and_then(|x| x.as_u64()),
+            Some(CACHE_VERSION)
+        );
         env::remove_var("HERDR_PLUGIN_STATE_DIR");
         let _ = fs::remove_dir_all(&dir);
     }

@@ -1,5 +1,9 @@
 # Changelog
 
+## [Unreleased]
+
+## 0.1.8 — 2026-07-11
+- fix: avoid counting inherited Codex subagent history
 
 ## 0.1.7 — 2026-07-10
 - feat: show model column in Rounds view and --dump-json

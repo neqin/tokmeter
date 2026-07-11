@@ -15,12 +15,14 @@ pub const SEP: char = '\u{1f}'; // разделитель полей ключа 
 pub struct FileState {
     pub size: u64,
     pub mtime: i64,
-    pub offset: u64,      // позиция после последнего полного '\n'
-    pub msgid: String,    // Claude: последний учтённый message.id (дедуп)
-    pub ptotal: u64,      // Codex: последний total_token_usage (монотонный)
-    pub proj: String,     // Codex: текущий cwd
-    pub model: String,    // Codex: текущая модель
-    pub last_pid: String, // Claude: последний учтённый promptId (счёт раундов)
+    pub offset: u64,          // позиция после последнего полного '\n'
+    pub msgid: String,        // Claude: последний учтённый message.id (дедуп)
+    pub ptotal: u64,          // Codex: последний total_token_usage (монотонный)
+    pub codex_parent: String, // Codex subagent: parent_thread_id до начала replay-префикса
+    pub codex_replay: bool,   // Codex subagent: пропускаем унаследованную историю родителя
+    pub proj: String,         // Codex: текущий cwd
+    pub model: String,        // Codex: текущая модель
+    pub last_pid: String,     // Claude: последний учтённый promptId (счёт раундов)
     // Аккумулятор открытого раунда (потокенная атрибуция); r_ts == 0 — раунда нет.
     pub r_ts: i64,
     pub r_proj: String,
@@ -54,9 +56,9 @@ pub struct Round {
 
 pub const ROUND_CAP: usize = 100;
 
-/// Версия формата. v3: почасовой агрегат/раунды пересобираются на апгрейде со
-/// старых кэшей (v1/v2), где они были неполны из-за инкрементальных офсетов.
-pub const CACHE_VERSION: u64 = 3;
+/// Версия формата. v4: недавние агрегаты пересобираются без унаследованной
+/// истории Codex subagent-сессий.
+pub const CACHE_VERSION: u64 = 4;
 
 pub struct Cache {
     pub files: HashMap<String, FileState>,
@@ -111,6 +113,8 @@ impl Cache {
                         offset: g("o"),
                         msgid: gs("id"),
                         ptotal: g("pt"),
+                        codex_parent: gs("cp"),
+                        codex_replay: fv.get("cr").and_then(|x| x.as_bool()).unwrap_or(false),
                         proj: gs("p"),
                         model: gs("md"),
                         last_pid: gs("lp"),
@@ -351,6 +355,12 @@ impl Cache {
             }
             if f.ptotal != 0 {
                 o.insert("pt".into(), f.ptotal.into());
+            }
+            if !f.codex_parent.is_empty() {
+                o.insert("cp".into(), f.codex_parent.clone().into());
+            }
+            if f.codex_replay {
+                o.insert("cr".into(), true.into());
             }
             if !f.proj.is_empty() {
                 o.insert("p".into(), f.proj.clone().into());
