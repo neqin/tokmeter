@@ -1,6 +1,7 @@
 # Changelog
 
 ## [Unreleased]
+- fix: skip expired grok cached auth before billing rpc
 
 ## 0.1.8 — 2026-07-11
 - fix: avoid counting inherited Codex subagent history

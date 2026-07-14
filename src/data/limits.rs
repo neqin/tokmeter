@@ -262,6 +262,27 @@ fn resolve_grok_bin(home: &str) -> PathBuf {
     PathBuf::from("grok")
 }
 
+fn grok_has_usable_cached_auth(auth: &Value, now: i64) -> bool {
+    auth.as_object().is_some_and(|scopes| {
+        scopes.values().any(|entry| {
+            let has_key = entry
+                .get("key")
+                .and_then(|value| value.as_str())
+                .is_some_and(|key| !key.is_empty());
+            if !has_key {
+                return false;
+            }
+            match entry.get("expires_at") {
+                None => true,
+                Some(expires_at) => expires_at
+                    .as_str()
+                    .and_then(parse_epoch)
+                    .is_some_and(|expires| expires > now),
+            }
+        })
+    })
+}
+
 /// Kill + wait on drop so early `?` after spawn cannot leave a zombie.
 struct ReapOnDrop(std::process::Child);
 
@@ -276,6 +297,12 @@ impl Drop for ReapOnDrop {
 /// Spawn `grok agent stdio`, auth with cached OAuth, call `_x.ai/billing`.
 /// Reads NDJSON until `creditUsagePercent` appears or a hard deadline hits.
 fn fetch_grok_cli_billing(home: &str, now: i64) -> Option<Snapshot> {
+    let text = std::fs::read_to_string(format!("{home}/.grok/auth.json")).ok()?;
+    let auth: Value = serde_json::from_str(&text).ok()?;
+    if !grok_has_usable_cached_auth(&auth, now) {
+        return None;
+    }
+
     let mut child = ReapOnDrop(
         Command::new(resolve_grok_bin(home))
             .args(["agent", "stdio"])
@@ -670,6 +697,29 @@ x-ratelimit-remaining-requests: 900\r\n\
         assert_eq!(snap.windows[0].label, "wk");
         assert!((snap.windows[0].pct - 2.0).abs() < 0.01);
         assert!(snap.windows[0].resets > 0);
+    }
+
+    #[test]
+    fn grok_skips_expired_cached_auth() {
+        let expired = serde_json::json!({
+            "https://auth.x.ai::client": {
+                "key": "token",
+                "expires_at": "2026-07-14T09:21:13Z"
+            }
+        });
+        let current = serde_json::json!({
+            "https://auth.x.ai::client": {
+                "key": "token",
+                "expires_at": "2026-07-14T10:21:13Z"
+            }
+        });
+
+        assert!(!grok_has_usable_cached_auth(&expired, 1_784_021_474));
+        assert!(grok_has_usable_cached_auth(&current, 1_784_021_474));
+        assert!(!grok_has_usable_cached_auth(
+            &serde_json::json!({}),
+            1_784_021_474
+        ));
     }
 
     #[test]
