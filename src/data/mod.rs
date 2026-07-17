@@ -1,7 +1,14 @@
 pub mod agg;
 pub mod cache;
+pub mod config;
+pub mod dataset;
 pub mod engine;
+pub mod identity;
 pub mod limits;
 pub mod pricing;
+pub mod private_io;
+pub mod protocol;
+pub mod remote;
+pub mod remote_store;
 pub mod scan;
 pub mod timeutil;
