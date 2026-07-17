@@ -26,7 +26,6 @@ impl SourceFilter {
 pub struct SourceDescriptor {
     pub id: String,
     pub label: String,
-    pub instance_id: String,
     pub local: bool,
     pub enabled: bool,
     pub active: bool,
@@ -76,6 +75,7 @@ impl<'a> Dataset<'a> {
         now: i64,
     ) -> Self {
         let mut sources = Vec::with_capacity(config.ssh_sources.len() + 1);
+        let identity_available = local_instance_id.is_some();
         let mut instances = HashSet::new();
         if let Some(instance_id) = local_instance_id.filter(|id| !id.is_empty()) {
             instances.insert(instance_id.to_string());
@@ -84,7 +84,6 @@ impl<'a> Dataset<'a> {
             descriptor: SourceDescriptor {
                 id: "local".to_string(),
                 label: "local".to_string(),
-                instance_id: local_instance_id.unwrap_or("").to_string(),
                 local: true,
                 enabled: true,
                 active: true,
@@ -129,7 +128,8 @@ impl<'a> Dataset<'a> {
                 health = SourceHealth::Disabled;
             }
 
-            let candidate = configured.enabled
+            let candidate = identity_available
+                && configured.enabled
                 && snapshot.is_some()
                 && matches!(
                     health,
@@ -148,17 +148,30 @@ impl<'a> Dataset<'a> {
                 health = SourceHealth::DuplicateInstance;
             }
             let active = candidate && !duplicate;
+            let mut warnings = stored
+                .map(|source| {
+                    source
+                        .warnings
+                        .iter()
+                        .copied()
+                        .filter(|warning| *warning != SourceWarning::PartialHistory)
+                        .collect::<Vec<_>>()
+                })
+                .unwrap_or_default();
+            if snapshot.is_some_and(|snapshot| {
+                snapshot.retention.history_days < config.retention.history_days
+                    || snapshot.retention.hours_days < config.retention.hours_days
+            }) {
+                warnings.push(SourceWarning::PartialHistory);
+            }
             let descriptor = SourceDescriptor {
                 id: configured.id.clone(),
                 label: configured.label.clone(),
-                instance_id: instance_id.to_string(),
                 local: false,
                 enabled: configured.enabled,
                 active,
                 health,
-                warnings: stored
-                    .map(|source| source.warnings.clone())
-                    .unwrap_or_default(),
+                warnings,
                 last_attempt: stored.map(|source| source.last_attempt).unwrap_or(0),
                 last_success: stored.map(|source| source.last_success).unwrap_or(0),
                 duration_ms: stored.map(|source| source.duration_ms).unwrap_or(0),
@@ -358,6 +371,62 @@ mod tests {
         let loopback = dataset.source("loop").unwrap();
         assert_eq!(loopback.health, SourceHealth::DuplicateInstance);
         assert!(!loopback.active);
+    }
+
+    #[test]
+    fn missing_local_identity_disables_remote_data() {
+        let local = cache();
+        let config = Config {
+            ssh_sources: vec![source("one", true)],
+            ..Config::default()
+        };
+        let mut store = RemoteStore::empty("/tmp");
+        store.apply_success("one", "ONE", snapshot(REMOTE_ID, 10), Vec::new(), NOW, 1);
+
+        let dataset = Dataset::new(&local, &config, None, &store, NOW);
+        assert!(!dataset.source("one").unwrap().active);
+        assert_eq!(dataset.selected(&SourceFilter::All).unwrap().len(), 1);
+    }
+
+    #[test]
+    fn partial_history_warning_uses_current_retention() {
+        let local = cache();
+        let mut remote = snapshot(REMOTE_ID, 10);
+        remote.retention.history_days = 30;
+        remote.retention.hours_days = 2;
+        let mut store = RemoteStore::empty("/tmp");
+        store.apply_success(
+            "one",
+            "ONE",
+            remote,
+            vec![
+                SourceWarning::PartialHistory,
+                SourceWarning::ReadOnlyRefresh,
+            ],
+            NOW,
+            1,
+        );
+        let mut config = Config {
+            ssh_sources: vec![source("one", true)],
+            ..Config::default()
+        };
+
+        let dataset = Dataset::new(&local, &config, Some(LOCAL_ID), &store, NOW);
+        assert_eq!(
+            dataset.source("one").unwrap().warnings,
+            vec![
+                SourceWarning::ReadOnlyRefresh,
+                SourceWarning::PartialHistory
+            ]
+        );
+
+        config.retention.history_days = 30;
+        config.retention.hours_days = 2;
+        let dataset = Dataset::new(&local, &config, Some(LOCAL_ID), &store, NOW);
+        assert_eq!(
+            dataset.source("one").unwrap().warnings,
+            vec![SourceWarning::ReadOnlyRefresh]
+        );
     }
 
     #[test]

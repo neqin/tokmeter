@@ -20,13 +20,13 @@ pub struct Tot {
 
 impl Tot {
     pub fn tokens(&self) -> u64 {
-        self.inp + self.out + self.cache
+        saturating_sum(&[self.inp, self.out, self.cache])
     }
     fn add(&mut self, req: u64, inp: u64, out: u64, cache: u64, cost: f64) {
-        self.req += req;
-        self.inp += inp;
-        self.out += out;
-        self.cache += cache;
+        self.req = self.req.saturating_add(req);
+        self.inp = self.inp.saturating_add(inp);
+        self.out = self.out.saturating_add(out);
+        self.cache = self.cache.saturating_add(cache);
         self.cost += cost;
     }
 }
@@ -246,7 +246,7 @@ fn build_maps(
                 _ => continue,
             }
             let inp = c[1];
-            let cache_t = c[2] + c[3] + c[4];
+            let cache_t = saturating_sum(&c[2..5]);
             let out = c[5];
             let cost = pricing.cost(model, speed, c[1], c[2], c[3], c[4], c[5]);
             agents
@@ -271,12 +271,12 @@ fn build_maps(
                 continue;
             }
             if hour == cur_hour {
-                rate_hour += hc[0];
+                rate_hour = rate_hour.saturating_add(hc[0]);
             }
             if tf.rounds_known() {
                 let date = if hour.len() >= 10 { &hour[..10] } else { hour };
                 if ymd_to_days(date).is_some_and(|d| d >= oldest && d <= today_days) {
-                    rounds_total += hc[1];
+                    rounds_total = rounds_total.saturating_add(hc[1]);
                 }
             }
         }
@@ -332,7 +332,7 @@ pub fn rounds_view(
             agent: r.agent.clone(),
             model: r.model.clone(),
             project: short_path(&r.project),
-            tokens: r.inp + r.cread + r.cw5 + r.cw1h + r.out,
+            tokens: saturating_sum(&[r.inp, r.cread, r.cw5, r.cw1h, r.out]),
             cost: pricing.cost(&r.model, &r.speed, r.inp, r.cread, r.cw5, r.cw1h, r.out),
         })
         .collect()
@@ -369,7 +369,7 @@ pub fn rounds_view_dataset(
             agent: round.agent.clone(),
             model: round.model.clone(),
             project: short_path(&round.project),
-            tokens: round.inp + round.cread + round.cw5 + round.cw1h + round.out,
+            tokens: saturating_sum(&[round.inp, round.cread, round.cw5, round.cw1h, round.out]),
             cost: pricing.cost(
                 &round.model,
                 &round.speed,
@@ -411,7 +411,7 @@ pub fn projects_view(
             c[0],
             c[1],
             c[5],
-            c[2] + c[3] + c[4],
+            saturating_sum(&c[2..5]),
             cost,
         );
     }
@@ -514,7 +514,7 @@ fn chart_buckets_maps(
                     }
                     if let Ok(h) = hour[11..13].parse::<usize>() {
                         if h < 24 {
-                            b[h] += hc[0];
+                            b[h] = b[h].saturating_add(hc[0]);
                         }
                     }
                 }
@@ -540,8 +540,9 @@ fn chart_buckets_maps(
                     {
                         continue;
                     }
-                    *map.entry(date[..7].to_string()).or_insert(0) +=
-                        c[1] + c[2] + c[3] + c[4] + c[5];
+                    let tokens = saturating_sum(&c[1..6]);
+                    let entry = map.entry(date[..7].to_string()).or_insert(0);
+                    *entry = entry.saturating_add(tokens);
                 }
             }
             map.into_iter()
@@ -579,7 +580,7 @@ fn chart_buckets_maps(
                         continue;
                     }
                     let index = (n - 1) - (age / div) as usize;
-                    b[index] += c[1] + c[2] + c[3] + c[4] + c[5];
+                    b[index] = b[index].saturating_add(saturating_sum(&c[1..6]));
                 }
             }
             (0..n)
@@ -598,6 +599,12 @@ fn chart_buckets_maps(
                 .collect()
         }
     }
+}
+
+fn saturating_sum(values: &[u64]) -> u64 {
+    values
+        .iter()
+        .fold(0u64, |total, value| total.saturating_add(*value))
 }
 
 fn per(tokens: f64, rounds: u64) -> f64 {
@@ -779,6 +786,50 @@ mod tests {
                 .iter()
                 .map(|bucket| bucket.tokens)
                 .collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn combined_values_saturate_without_panicking() {
+        let mut local = cache();
+        let mut local_data = CompactData::default();
+        add_data(&mut local_data, u64::MAX, NOW);
+        local.agg = local_data.agg;
+        local.hours = local_data.hours;
+        local.rounds = local_data.rounds;
+        let config = config();
+        let mut store = RemoteStore::empty("/tmp");
+        store.apply_success(
+            "lxc",
+            "LXC",
+            snapshot(i64::MAX as u64, NOW),
+            Vec::new(),
+            NOW,
+            1,
+        );
+        let dataset = dataset(&local, &config, &store);
+        let pricing = Pricing::load("{}");
+        let day = ymd_to_days("2026-07-17").unwrap();
+        let summary = build_dataset(
+            &dataset,
+            &SourceFilter::All,
+            &pricing,
+            Timeframe::Day,
+            &SourceScope {
+                source_id: None,
+                project_root: None,
+            },
+            day,
+            "2026-07-17 20",
+            12.0,
+        )
+        .unwrap();
+
+        assert_eq!(summary.agents_total.tokens(), u64::MAX);
+        assert_eq!(summary.rate_hour, u64::MAX);
+        assert_eq!(
+            summary.chart.iter().map(|bucket| bucket.tokens).max(),
+            Some(u64::MAX)
         );
     }
 

@@ -1,10 +1,13 @@
 use super::private_io;
 use super::protocol::{decode_json, ProtocolRetention, SourceSnapshot, SourceWarning};
+use super::timeutil::now_epoch;
 use serde_json::{Map, Value};
-use std::collections::HashMap;
-use std::fs;
+use std::collections::{HashMap, HashSet};
+use std::fs::{self, File, OpenOptions};
 use std::io;
-use std::path::PathBuf;
+use std::os::unix::fs::OpenOptionsExt;
+use std::os::unix::io::AsRawFd;
+use std::path::{Path, PathBuf};
 
 pub const REMOTE_STORE_VERSION: u64 = 1;
 
@@ -43,11 +46,39 @@ pub struct RemoteStore {
     pub load_error: Option<String>,
     path: PathBuf,
     writable: bool,
-    dirty: bool,
+    dirty_sources: HashSet<String>,
 }
 
 pub fn remote_store_path(home: &str) -> PathBuf {
     private_io::cache_dir(home).join("remote.json")
+}
+
+struct RemoteStoreLock(File);
+
+impl RemoteStoreLock {
+    fn acquire(path: &Path) -> io::Result<Self> {
+        if let Some(parent) = path.parent() {
+            fs::create_dir_all(parent)?;
+        }
+        let file = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .mode(0o600)
+            .open(path.with_extension("json.lock"))?;
+        let rc = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
+        if rc != 0 {
+            return Err(io::Error::last_os_error());
+        }
+        Ok(Self(file))
+    }
+}
+
+impl Drop for RemoteStoreLock {
+    fn drop(&mut self) {
+        let _ = unsafe { libc::flock(self.0.as_raw_fd(), libc::LOCK_UN) };
+    }
 }
 
 impl RemoteStore {
@@ -62,7 +93,7 @@ impl RemoteStore {
             load_error: None,
             path: remote_store_path(home),
             writable: true,
-            dirty: false,
+            dirty_sources: HashSet::new(),
         }
     }
 
@@ -75,7 +106,7 @@ impl RemoteStore {
                     load_error: None,
                     path,
                     writable: true,
-                    dirty: false,
+                    dirty_sources: HashSet::new(),
                 };
             }
             Err(error) => {
@@ -88,7 +119,7 @@ impl RemoteStore {
                 load_error: None,
                 path,
                 writable: true,
-                dirty: false,
+                dirty_sources: HashSet::new(),
             },
             Err(error) => Self::failed(path, error),
         }
@@ -100,7 +131,7 @@ impl RemoteStore {
             load_error: Some(short_error(error)),
             path,
             writable: false,
-            dirty: false,
+            dirty_sources: HashSet::new(),
         }
     }
 
@@ -130,7 +161,7 @@ impl RemoteStore {
         entry.health = SourceHealth::Healthy;
         entry.warnings = warnings;
         entry.error.clear();
-        self.dirty = true;
+        self.dirty_sources.insert(source_id.to_string());
     }
 
     pub fn apply_failure(
@@ -152,11 +183,11 @@ impl RemoteStore {
             AttemptFailureKind::Error => SourceHealth::Error,
         };
         entry.error = short_error(error.into());
-        self.dirty = true;
+        self.dirty_sources.insert(source_id.to_string());
     }
 
     pub fn save(&mut self) -> io::Result<()> {
-        if !self.dirty {
+        if self.dirty_sources.is_empty() {
             return Ok(());
         }
         if !self.writable {
@@ -165,9 +196,22 @@ impl RemoteStore {
                 "remote cache is invalid; remove it before saving",
             ));
         }
+        let _lock = RemoteStoreLock::acquire(&self.path)?;
+        let mut merged = load_sources_for_merge(&self.path)?;
+        for source_id in &self.dirty_sources {
+            let Some(update) = self.sources.get(source_id).cloned() else {
+                continue;
+            };
+            let source = match merged.remove(source_id) {
+                Some(existing) => merge_source(existing, update),
+                None => update,
+            };
+            merged.insert(source_id.clone(), source);
+        }
+        self.sources = merged;
         let text = serde_json::to_vec(&self.to_value())?;
         private_io::atomic_write_private(&self.path, &text)?;
-        self.dirty = false;
+        self.dirty_sources.clear();
         Ok(())
     }
 
@@ -221,6 +265,47 @@ impl RemoteStore {
         root.insert("sources".into(), Value::Object(sources));
         Value::Object(root)
     }
+}
+
+fn load_sources_for_merge(path: &Path) -> io::Result<HashMap<String, StoredSource>> {
+    let text = match fs::read_to_string(path) {
+        Ok(text) => text,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(HashMap::new()),
+        Err(error) => return Err(error),
+    };
+    decode_store(
+        &text,
+        now_epoch(),
+        ProtocolRetention {
+            history_days: 3650,
+            hours_days: 3650,
+        },
+    )
+    .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))
+}
+
+fn merge_source(existing: StoredSource, mut update: StoredSource) -> StoredSource {
+    if update.last_attempt < existing.last_attempt {
+        return existing;
+    }
+    let existing_last_success = existing.last_success;
+    let existing_generated = existing
+        .snapshot
+        .as_ref()
+        .map(|snapshot| snapshot.generated_at)
+        .unwrap_or(0);
+    let update_generated = update
+        .snapshot
+        .as_ref()
+        .map(|snapshot| snapshot.generated_at)
+        .unwrap_or(0);
+    if existing_last_success > update.last_success || existing_generated > update_generated {
+        update.instance_id = existing.instance_id;
+        update.snapshot = existing.snapshot;
+        update.warnings = existing.warnings;
+    }
+    update.last_success = update.last_success.max(existing_last_success);
+    update
 }
 
 fn decode_store(
@@ -430,7 +515,7 @@ mod tests {
             load_error: None,
             path,
             writable: true,
-            dirty: false,
+            dirty_sources: HashSet::new(),
         }
     }
 
@@ -519,12 +604,47 @@ mod tests {
     }
 
     #[test]
+    fn concurrent_writers_merge_dirty_sources_and_keep_newer_snapshot() {
+        let path = temp_path("concurrent");
+        let mut seed = store(path.clone());
+        seed.apply_success("one", "ONE", snapshot(ID1), Vec::new(), NOW, 1);
+        seed.save().unwrap();
+
+        let mut first = RemoteStore::load_path(path.clone(), NOW, retention());
+        let mut second = RemoteStore::load_path(path.clone(), NOW, retention());
+        let mut newer = snapshot(ID2);
+        newer.generated_at = NOW + 1;
+        first.apply_success("one", "ONE", newer, Vec::new(), NOW + 1, 1);
+        first.save().unwrap();
+
+        second.apply_success("two", "TWO", snapshot(ID1), Vec::new(), NOW + 2, 1);
+        second.apply_failure(
+            "one",
+            "ONE",
+            AttemptFailureKind::Error,
+            "offline",
+            NOW + 2,
+            1,
+        );
+        second.save().unwrap();
+
+        let loaded = RemoteStore::load_path(path.clone(), NOW + 2, retention());
+        assert_eq!(loaded.sources.len(), 2);
+        assert_eq!(loaded.sources["one"].instance_id, ID2);
+        assert_eq!(loaded.sources["one"].last_success, NOW + 1);
+        assert_eq!(loaded.sources["one"].health, SourceHealth::Stale);
+        assert!(loaded.sources.contains_key("two"));
+        let _ = fs::remove_file(path.with_extension("json.lock"));
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
     fn connecting_is_not_persisted() {
         let path = temp_path("connecting");
         let mut store = store(path.clone());
         store.apply_success("lxc", "LXC", snapshot(ID1), Vec::new(), NOW, 10);
         store.set_connecting("lxc", "LXC", NOW + 1);
-        store.dirty = true;
+        store.dirty_sources.insert("lxc".into());
         store.save().unwrap();
         let loaded = RemoteStore::load_path(path.clone(), NOW + 1, retention());
         assert_eq!(loaded.sources["lxc"].health, SourceHealth::Stale);

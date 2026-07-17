@@ -376,3 +376,8 @@ specification, or CHANGELOG again.
   remote binary were provided in this session. Project `/verify` was also
   unavailable because this checkout has no verify skill; the explicit release
   gate commands were run instead.
+- 2026-07-18: Final branch review round 1 findings were addressed: identity
+  failures now gate remote collection and activation, compact payload keys and
+  counters are bounded, aggregate sums saturate, RemoteStore writes lock and
+  merge dirty sources, retention warnings are derived at view time, public JSON
+  omits installation IDs, and the full branch diff passes whitespace checks.

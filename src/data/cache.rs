@@ -9,6 +9,7 @@ use std::fs;
 use std::path::PathBuf;
 
 pub const SEP: char = '\u{1f}'; // разделитель полей ключа агрегата
+const MAX_COMPACT_COUNT: u64 = i64::MAX as u64;
 
 /// Состояние одного файла сессии для инкрементального чтения.
 #[derive(Default, Clone)]
@@ -460,7 +461,7 @@ fn decode_compact(value: &Value, strict: bool) -> Result<CompactData, String> {
                     }
                     continue;
                 };
-                if array.len() != 6 || (strict && key.split(SEP).count() != 5) {
+                if array.len() != 6 || (strict && !valid_aggregate_key(key)) {
                     if strict {
                         return Err(format!("invalid aggregate {key}"));
                     }
@@ -472,6 +473,9 @@ fn decode_compact(value: &Value, strict: bool) -> Result<CompactData, String> {
                     }
                     continue;
                 };
+                if strict && !valid_counts(&counts) {
+                    return Err(format!("invalid aggregate {key}"));
+                }
                 data.agg.insert(key.clone(), counts);
             }
         }
@@ -488,7 +492,7 @@ fn decode_compact(value: &Value, strict: bool) -> Result<CompactData, String> {
                     }
                     continue;
                 };
-                if array.len() != 2 || (strict && key.split(SEP).count() != 3) {
+                if array.len() != 2 || (strict && !valid_hour_key(key)) {
                     if strict {
                         return Err(format!("invalid hour aggregate {key}"));
                     }
@@ -500,6 +504,9 @@ fn decode_compact(value: &Value, strict: bool) -> Result<CompactData, String> {
                     }
                     continue;
                 };
+                if strict && !valid_counts(&counts) {
+                    return Err(format!("invalid hour aggregate {key}"));
+                }
                 data.hours.insert(key.clone(), counts);
             }
         }
@@ -518,7 +525,9 @@ fn decode_compact(value: &Value, strict: bool) -> Result<CompactData, String> {
                 };
                 let round = decode_round(array);
                 match round {
-                    Some(round) if array.len() == 10 => data.rounds.push(round),
+                    Some(round) if array.len() == 10 && (!strict || valid_round(&round)) => {
+                        data.rounds.push(round)
+                    }
                     _ if strict => return Err("invalid round".to_string()),
                     _ => {}
                 }
@@ -557,6 +566,54 @@ fn array_u64<const N: usize>(array: &[Value]) -> Option<[u64; N]> {
         values[index] = value.as_u64()?;
     }
     Some(values)
+}
+
+fn valid_counts(values: &[u64]) -> bool {
+    values
+        .iter()
+        .try_fold(0u64, |total, value| total.checked_add(*value))
+        .is_some_and(|total| total <= MAX_COMPACT_COUNT)
+}
+
+fn valid_aggregate_key(key: &str) -> bool {
+    let fields: Vec<_> = key.split(SEP).collect();
+    fields.len() == 5 && valid_date(fields[0])
+}
+
+fn valid_hour_key(key: &str) -> bool {
+    let fields: Vec<_> = key.split(SEP).collect();
+    fields.len() == 3 && valid_hour(fields[0])
+}
+
+fn valid_date(value: &str) -> bool {
+    let bytes = value.as_bytes();
+    if bytes.len() != 10
+        || !value.is_ascii()
+        || bytes[4] != b'-'
+        || bytes[7] != b'-'
+        || bytes
+            .iter()
+            .enumerate()
+            .any(|(index, byte)| !matches!(index, 4 | 7) && !byte.is_ascii_digit())
+    {
+        return false;
+    }
+    let month = value[5..7].parse::<u8>().ok();
+    let day = value[8..10].parse::<u8>().ok();
+    month.is_some_and(|month| (1..=12).contains(&month))
+        && day.is_some_and(|day| (1..=31).contains(&day))
+}
+
+fn valid_hour(value: &str) -> bool {
+    value.len() == 13
+        && value.is_ascii()
+        && valid_date(&value[..10])
+        && value.as_bytes()[10] == b' '
+        && value[11..13].parse::<u8>().is_ok_and(|hour| hour < 24)
+}
+
+fn valid_round(round: &Round) -> bool {
+    round.ts > 0 && valid_counts(&[round.inp, round.cread, round.cw5, round.cw1h, round.out])
 }
 
 fn decode_round(array: &[Value]) -> Option<Round> {
@@ -728,5 +785,44 @@ mod tests {
         ] {
             assert!(compact_from_value(&value).is_err());
         }
+    }
+
+    #[test]
+    fn strict_decoder_rejects_unsafe_keys_and_counters() {
+        let data = sample_data();
+        let aggregate_key = data.agg.keys().next().unwrap().clone();
+        let hour_key = data.hours.keys().next().unwrap().clone();
+
+        let mut invalid_date = compact_to_value(&data);
+        let counts = invalid_date["agg"]
+            .as_object_mut()
+            .unwrap()
+            .remove(&aggregate_key)
+            .unwrap();
+        invalid_date["agg"].as_object_mut().unwrap().insert(
+            format!("é026-07-17{SEP}claude{SEP}opus{SEP}standard{SEP}/proj"),
+            counts,
+        );
+        assert!(compact_from_value(&invalid_date).is_err());
+
+        let mut invalid_hour = compact_to_value(&data);
+        let counts = invalid_hour["hours"]
+            .as_object_mut()
+            .unwrap()
+            .remove(&hour_key)
+            .unwrap();
+        invalid_hour["hours"]
+            .as_object_mut()
+            .unwrap()
+            .insert(format!("2026-07-17 99{SEP}claude{SEP}/proj"), counts);
+        assert!(compact_from_value(&invalid_hour).is_err());
+
+        let mut oversized = compact_to_value(&data);
+        oversized["agg"][&aggregate_key][1] = u64::MAX.into();
+        assert!(compact_from_value(&oversized).is_err());
+
+        let mut oversized_round = compact_to_value(&data);
+        oversized_round["rounds"][0][5] = u64::MAX.into();
+        assert!(compact_from_value(&oversized_round).is_err());
     }
 }

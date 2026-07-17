@@ -1,6 +1,6 @@
 # Remote SSH Sources for tokmeter
 
-**Date:** 2026-07-17  
+**Date:** 2026-07-17
 **Status:** Draft awaiting final specification review
 
 ## Summary

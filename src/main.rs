@@ -125,7 +125,6 @@ struct LimitRowOwned {
 struct SourceOwned {
     id: String,
     label: String,
-    instance_id: String,
     local: bool,
     enabled: bool,
     active: bool,
@@ -315,7 +314,6 @@ fn build_snapshot(
         .map(|source| SourceOwned {
             id: source.id.clone(),
             label: source.label.clone(),
-            instance_id: source.instance_id.clone(),
             local: source.local,
             enabled: source.enabled,
             active: source.active,
@@ -376,7 +374,7 @@ fn snapshot_to_json(snap: &ViewSnapshot, mode: &str) -> serde_json::Value {
         .map(|a| {
             serde_json::json!({
                 "name": a.name,
-                "tokens": a.input + a.output + a.cache,
+                "tokens": a.input.saturating_add(a.output).saturating_add(a.cache),
                 "cost": a.cost,
                 "req": a.req,
             })
@@ -449,7 +447,6 @@ fn snapshot_to_json(snap: &ViewSnapshot, mode: &str) -> serde_json::Value {
             serde_json::json!({
                 "id": source.id,
                 "label": source.label,
-                "instance_id": source.instance_id,
                 "local": source.local,
                 "enabled": source.enabled,
                 "active": source.active,
@@ -772,7 +769,11 @@ fn remote_sources_due(
     store: &RemoteStore,
     now: i64,
     force: bool,
+    identity_available: bool,
 ) -> Vec<data::config::SshSourceConfig> {
+    if !identity_available {
+        return Vec::new();
+    }
     config
         .ssh_sources
         .iter()
@@ -945,7 +946,13 @@ impl Dashboard {
 
     fn schedule_remote_refresh(&mut self, cx: &mut Context<Self>) {
         let force = self.remote_refresh.force;
-        let sources = remote_sources_due(&self.config, &self.remote_store, now_epoch(), force);
+        let sources = remote_sources_due(
+            &self.config,
+            &self.remote_store,
+            now_epoch(),
+            force,
+            self.local_instance_id.is_some(),
+        );
         if !self.remote_refresh.begin(!sources.is_empty()) {
             if sources.is_empty() && !self.remote_refresh.in_flight {
                 self.remote_refresh.force = false;
@@ -2231,12 +2238,13 @@ fn run_dump(args: DumpArgs) -> Result<(), String> {
     };
     let mut store = RemoteStore::load(&home, now_epoch(), retention);
     diagnostics.remote_store = store.load_error.clone();
-    let enabled_sources = config
-        .ssh_sources
-        .iter()
-        .filter(|source| source.enabled)
-        .cloned()
-        .collect();
+    let enabled_sources = remote_sources_due(
+        &config,
+        &store,
+        now_epoch(),
+        true,
+        local_instance_id.is_some(),
+    );
     let mut coordinator = RemoteCoordinator::default();
     let results = coordinator.start(enabled_sources, config.refresh, retention, &mut store);
     for result in results {
@@ -2400,14 +2408,15 @@ mod dashboard_refresh_tests {
         let mut store = RemoteStore::empty("/tmp");
         store.set_connecting("due", "DUE", 100);
         store.set_connecting("recent", "RECENT", 190);
-        let due = remote_sources_due(&config, &store, 200, false);
+        let due = remote_sources_due(&config, &store, 200, false, true);
         assert_eq!(
             due.iter()
                 .map(|source| source.id.as_str())
                 .collect::<Vec<_>>(),
             vec!["due"]
         );
-        let forced = remote_sources_due(&config, &store, 200, true);
+        assert!(remote_sources_due(&config, &store, 200, true, false).is_empty());
+        let forced = remote_sources_due(&config, &store, 200, true, true);
         assert_eq!(
             forced
                 .iter()
@@ -2565,7 +2574,6 @@ mod json_schema_tests {
         snapshot.sources.push(SourceOwned {
             id: "lxc".into(),
             label: "LXC".into(),
-            instance_id: "223e4567-e89b-12d3-a456-426614174000".into(),
             local: false,
             enabled: true,
             active: true,
@@ -2600,6 +2608,7 @@ mod json_schema_tests {
         assert_eq!(value["rounds"][0]["source_id"], "lxc");
         assert_eq!(value["limits"][0]["source_id"], "lxc");
         assert_eq!(value["sources"][0]["health"], "stale");
+        assert!(value["sources"][0].get("instance_id").is_none());
         assert_eq!(value["sources"][0]["warnings"][0], "partial_history");
         assert_eq!(value["diagnostics"]["config"], "invalid config");
     }
@@ -2756,7 +2765,6 @@ mod source_filter_tests {
         SourceOwned {
             id: id.into(),
             label: id.to_uppercase(),
-            instance_id: String::new(),
             local,
             enabled: true,
             active: true,
@@ -2799,7 +2807,6 @@ mod source_status_tests {
         let source = SourceOwned {
             id: "lxc".into(),
             label: "LXC".into(),
-            instance_id: String::new(),
             local: false,
             enabled: true,
             active: true,
