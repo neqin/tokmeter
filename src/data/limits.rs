@@ -41,7 +41,7 @@ pub struct Row {
 /// Подготовить строки агентов к рендеру: выкинуть окна, чей resets в
 /// прошлом (данные пережили сброс — процент уже не тот).
 pub fn rows(get: impl Fn(&str) -> Option<Snapshot>, now: i64) -> Vec<Row> {
-    ["claude", "codex", "grok"]
+    ["claude", "codex"]
         .iter()
         .map(|agent| {
             let snap = get(agent).unwrap_or_default();
@@ -667,7 +667,8 @@ mod tests {
         let codex = got.iter().find(|r| r.agent == "codex").unwrap();
         let labels: Vec<_> = codex.windows.iter().map(|w| w.label.as_str()).collect();
         assert_eq!(labels, vec!["5h", "wk"]);
-        assert!(got.iter().any(|r| r.agent == "grok"));
+        let agents: Vec<_> = got.iter().map(|r| r.agent).collect();
+        assert_eq!(agents, vec!["claude", "codex"]);
     }
 
     #[test]

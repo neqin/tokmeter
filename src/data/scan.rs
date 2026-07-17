@@ -2,6 +2,7 @@
 //! вырос; читаем лишь дописанный хвост; учитываем каждый API-запрос один раз.
 
 use super::cache::{Cache, FileState};
+use super::config::LocalSourcesConfig;
 use super::limits;
 use super::timeutil::{local_day, parse_epoch, ymd_hour_str, ymd_str};
 use serde_json::Value;
@@ -23,10 +24,28 @@ pub struct Scanner {
     min_mtime: i64,
     off: i64,      // локальное смещение для датирования
     ring_min: i64, // нижняя граница ts для кольца раундов (epoch)
+    enabled: LocalSourcesConfig,
 }
 
 impl Scanner {
+    #[cfg(test)]
     pub fn new(home: &str, min_mtime: i64, off: i64, ring_min: i64) -> Scanner {
+        Self::new_with_sources(
+            home,
+            min_mtime,
+            off,
+            ring_min,
+            LocalSourcesConfig::default(),
+        )
+    }
+
+    pub fn new_with_sources(
+        home: &str,
+        min_mtime: i64,
+        off: i64,
+        ring_min: i64,
+        enabled: LocalSourcesConfig,
+    ) -> Scanner {
         Scanner {
             claude_root: Path::new(home).join(".claude").join("projects"),
             codex_root: Path::new(home).join(".codex").join("sessions"),
@@ -35,15 +54,27 @@ impl Scanner {
             min_mtime,
             off,
             ring_min,
+            enabled,
         }
     }
 
     /// Подхватить новые/выросшие файлы и дописать агрегаты в кэш.
     pub fn update(&self, cache: &mut Cache) {
         let mut files: Vec<(PathBuf, u64, i64, Source)> = Vec::new();
-        walk(&self.claude_root, self.min_mtime, Source::Claude, &mut files);
-        walk(&self.codex_root, self.min_mtime, Source::Codex, &mut files);
-        walk(&self.omp_root, self.min_mtime, Source::Omp, &mut files);
+        if self.enabled.claude {
+            walk(
+                &self.claude_root,
+                self.min_mtime,
+                Source::Claude,
+                &mut files,
+            );
+        }
+        if self.enabled.codex {
+            walk(&self.codex_root, self.min_mtime, Source::Codex, &mut files);
+        }
+        if self.enabled.omp {
+            walk(&self.omp_root, self.min_mtime, Source::Omp, &mut files);
+        }
 
         for (path, size, mtime, source) in &files {
             let key = path.to_string_lossy().into_owned();
@@ -233,10 +264,21 @@ impl Scanner {
         let t = o.get("type").and_then(|x| x.as_str()).unwrap_or("");
         let p = &o["payload"];
         if st.codex_replay {
-            if t == "inter_agent_communication_metadata" {
-                st.codex_replay = false;
-                st.codex_parent.clear();
-                st.ptotal = 0;
+            match t {
+                "inter_agent_communication_metadata" => {
+                    st.codex_replay = false;
+                    st.codex_parent.clear();
+                    st.ptotal = 0;
+                }
+                "turn_context" => {
+                    if let Some(c) = p.get("cwd").and_then(|x| x.as_str()) {
+                        st.proj = c.to_string();
+                    }
+                    if let Some(m) = p.get("model").and_then(|x| x.as_str()) {
+                        st.model = m.to_string();
+                    }
+                }
+                _ => {}
             }
             return;
         }
@@ -248,11 +290,15 @@ impl Scanner {
                     return;
                 }
                 if st.codex_parent.is_empty() {
-                    st.codex_parent = p
+                    let parent = p
                         .pointer("/source/subagent/thread_spawn/parent_thread_id")
                         .and_then(|x| x.as_str())
-                        .unwrap_or("")
-                        .to_string();
+                        .unwrap_or("");
+                    if !parent.is_empty() {
+                        st.codex_parent = parent.to_string();
+                        st.codex_replay =
+                            p.get("forked_from_id").and_then(|x| x.as_str()) == Some(parent);
+                    }
                 }
                 if let Some(c) = p.get("cwd").and_then(|x| x.as_str()) {
                     st.proj = c.to_string();
@@ -434,12 +480,10 @@ impl Scanner {
         let model = msg
             .get("model")
             .and_then(|x| x.as_str())
-            .or_else(|| {
-                if st.model.is_empty() {
-                    None
-                } else {
-                    Some(st.model.as_str())
-                }
+            .or(if st.model.is_empty() {
+                None
+            } else {
+                Some(st.model.as_str())
             })
             .unwrap_or("unknown");
         let date = match o
@@ -590,7 +634,7 @@ fn walk(root: &Path, min_mtime: i64, source: Source, out: &mut Vec<(PathBuf, u64
         };
         if ft.is_dir() {
             walk(&p, min_mtime, source, out);
-        } else if p.extension().map_or(false, |x| x == "jsonl") {
+        } else if p.extension().is_some_and(|x| x == "jsonl") {
             if let Ok(md) = e.metadata() {
                 let mt = mtime_secs(&md);
                 if mt >= min_mtime {
@@ -611,8 +655,8 @@ fn mtime_secs(md: &fs::Metadata) -> i64 {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
     use super::super::cache::Cache;
+    use super::*;
     use std::io::Write;
 
     #[test]
@@ -629,6 +673,40 @@ mod tests {
     fn omp_project_fallback_decodes_session_dir() {
         let p = Path::new("/home/u/.omp/agent/sessions/-proj-tools-telvault/s.jsonl");
         assert_eq!(omp_project_fallback(p), "/proj/tools/telvault");
+    }
+
+    #[test]
+    fn disabled_sources_are_not_scanned() {
+        let dir = std::env::temp_dir().join(format!(
+            "tokmeter-disabled-scan-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let sess = dir.join(".omp/agent/sessions/test");
+        fs::create_dir_all(&sess).unwrap();
+        fs::write(
+            sess.join("session.jsonl"),
+            r#"{"type":"message","id":"a1","timestamp":"2026-07-08T12:00:02.000Z","message":{"role":"assistant","model":"gpt-5.5","usage":{"input":100,"output":20}}}\n"#,
+        )
+        .unwrap();
+        let mut cache = Cache::load(dir.join("cache.json"));
+        let scanner = Scanner::new_with_sources(
+            dir.to_str().unwrap(),
+            0,
+            0,
+            0,
+            LocalSourcesConfig {
+                claude: false,
+                codex: false,
+                omp: false,
+            },
+        );
+        scanner.update(&mut cache);
+        assert!(cache.files.is_empty());
+        assert!(cache.agg.is_empty());
+        let _ = fs::remove_dir_all(dir);
     }
 
     #[test]
@@ -682,7 +760,11 @@ mod tests {
                 found = true;
             }
         }
-        assert!(found, "omp aggregate missing: {:?}", cache.agg.keys().collect::<Vec<_>>());
+        assert!(
+            found,
+            "omp aggregate missing: {:?}",
+            cache.agg.keys().collect::<Vec<_>>()
+        );
         assert!(
             cache.hours.values().any(|h| h[1] >= 1),
             "expected at least one round in hours"
@@ -711,7 +793,7 @@ mod tests {
         let mut f = fs::File::create(&child).unwrap();
         writeln!(
             f,
-            r#"{{"timestamp":"2026-07-11T12:00:00Z","type":"session_meta","payload":{{"id":"child","cwd":"/tmp/demo","source":{{"subagent":{{"thread_spawn":{{"parent_thread_id":"parent"}}}}}}}}}}"#
+            r#"{{"timestamp":"2026-07-11T12:00:00Z","type":"session_meta","payload":{{"id":"child","cwd":"/tmp/demo","forked_from_id":"parent","source":{{"subagent":{{"thread_spawn":{{"parent_thread_id":"parent"}}}}}}}}}}"#
         )
         .unwrap();
 
@@ -742,11 +824,6 @@ mod tests {
         let mut f = fs::OpenOptions::new().append(true).open(child).unwrap();
         writeln!(
             f,
-            r#"{{"timestamp":"2026-07-11T12:00:00Z","type":"session_meta","payload":{{"id":"parent","cwd":"/tmp/demo","source":"cli"}}}}"#
-        )
-        .unwrap();
-        writeln!(
-            f,
             r#"{{"timestamp":"2026-07-11T12:00:00Z","type":"event_msg","payload":{{"type":"user_message","message":"inherited"}}}}"#
         )
         .unwrap();
@@ -757,12 +834,12 @@ mod tests {
         .unwrap();
         writeln!(
             f,
-            r#"{{"timestamp":"2026-07-11T12:00:01Z","type":"inter_agent_communication_metadata","payload":{{}}}}"#
+            r#"{{"timestamp":"2026-07-11T12:00:01Z","type":"turn_context","payload":{{"cwd":"/tmp/demo","model":"gpt-5.6-sol"}}}}"#
         )
         .unwrap();
         writeln!(
             f,
-            r#"{{"timestamp":"2026-07-11T12:00:02Z","type":"turn_context","payload":{{"cwd":"/tmp/demo","model":"gpt-5.6-sol"}}}}"#
+            r#"{{"timestamp":"2026-07-11T12:00:02Z","type":"inter_agent_communication_metadata","payload":{{}}}}"#
         )
         .unwrap();
         writeln!(
@@ -787,6 +864,79 @@ mod tests {
         });
         assert_eq!(counts, [2, 30, 100, 0, 0, 20]);
         assert_eq!(cache.hours.values().map(|h| h[1]).sum::<u64>(), 2);
+        assert_eq!(cache.agg.len(), 1);
+        assert!(cache
+            .agg
+            .keys()
+            .all(|key| key.contains("\u{1f}gpt-5.6-sol\u{1f}")));
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn scans_legacy_codex_subagent_without_replay_marker() {
+        let dir = std::env::temp_dir().join(format!(
+            "tokmeter-codex-legacy-subagent-scan-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let mut cache = Cache::load(dir.join("cache.json"));
+        let scanner = Scanner::new(dir.to_str().unwrap(), 0, 0, 0);
+        let mut st = FileState::default();
+
+        for event in [
+            serde_json::json!({
+                "timestamp": "2026-03-13T12:00:00Z",
+                "type": "session_meta",
+                "payload": {
+                    "id": "child",
+                    "cwd": "/tmp/demo",
+                    "source": {
+                        "subagent": {
+                            "thread_spawn": {"parent_thread_id": "parent"}
+                        }
+                    }
+                }
+            }),
+            serde_json::json!({
+                "timestamp": "2026-03-13T12:00:01Z",
+                "type": "turn_context",
+                "payload": {"cwd": "/tmp/demo", "model": "gpt-5.4"}
+            }),
+            serde_json::json!({
+                "timestamp": "2026-03-13T12:00:02Z",
+                "type": "event_msg",
+                "payload": {"type": "user_message", "message": "legacy child"}
+            }),
+            serde_json::json!({
+                "timestamp": "2026-03-13T12:00:03Z",
+                "type": "event_msg",
+                "payload": {
+                    "type": "token_count",
+                    "info": {
+                        "total_token_usage": {"total_tokens": 110},
+                        "last_token_usage": {
+                            "input_tokens": 100,
+                            "cached_input_tokens": 80,
+                            "output_tokens": 10
+                        }
+                    }
+                }
+            }),
+        ] {
+            scanner.codex_line(&event, &mut st, &mut cache);
+        }
+
+        let counts = cache.agg.values().fold([0u64; 6], |mut total, counts| {
+            for i in 0..6 {
+                total[i] += counts[i];
+            }
+            total
+        });
+        assert_eq!(counts, [1, 20, 80, 0, 0, 10]);
+        assert_eq!(cache.hours.values().map(|h| h[1]).sum::<u64>(), 1);
 
         let _ = fs::remove_dir_all(&dir);
     }

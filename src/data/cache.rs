@@ -9,6 +9,7 @@ use std::fs;
 use std::path::PathBuf;
 
 pub const SEP: char = '\u{1f}'; // разделитель полей ключа агрегата
+const MAX_COMPACT_COUNT: u64 = i64::MAX as u64;
 
 /// Состояние одного файла сессии для инкрементального чтения.
 #[derive(Default, Clone)]
@@ -40,7 +41,7 @@ pub type Counts = [u64; 6];
 
 /// Один завершённый раунд (пользовательский ход) с потокенной разбивкой.
 /// Стоимость считается при рендере через pricing — здесь не храним.
-#[derive(Clone)]
+#[derive(Clone, Debug, PartialEq)]
 pub struct Round {
     pub ts: i64,
     pub agent: String,
@@ -54,11 +55,18 @@ pub struct Round {
     pub out: u64,
 }
 
+#[derive(Clone, Default)]
+pub struct CompactData {
+    pub agg: HashMap<String, Counts>,
+    pub hours: HashMap<String, [u64; 2]>,
+    pub rounds: Vec<Round>,
+    pub limits: HashMap<String, Snapshot>,
+}
+
 pub const ROUND_CAP: usize = 100;
 
-/// Версия формата. v4: недавние агрегаты пересобираются без унаследованной
-/// истории Codex subagent-сессий.
-pub const CACHE_VERSION: u64 = 4;
+/// Версия формата. v5: Codex subagent-сессии сохраняют модель из replay-префикса.
+pub const CACHE_VERSION: u64 = 5;
 
 pub struct Cache {
     pub files: HashMap<String, FileState>,
@@ -131,83 +139,24 @@ impl Cache {
                 );
             }
         }
-        if let Some(agg) = v.get("agg").and_then(|x| x.as_object()) {
-            for (k, av) in agg {
-                if let Some(arr) = av.as_array() {
-                    let mut c6 = [0u64; 6];
-                    for i in 0..6 {
-                        c6[i] = arr.get(i).and_then(|x| x.as_u64()).unwrap_or(0);
-                    }
-                    c.agg.insert(k.clone(), c6);
-                }
-            }
-        }
-        if let Some(hours) = v.get("hours").and_then(|x| x.as_object()) {
-            for (k, av) in hours {
-                if let Some(arr) = av.as_array() {
-                    c.hours.insert(
-                        k.clone(),
-                        [
-                            arr.first().and_then(|x| x.as_u64()).unwrap_or(0),
-                            arr.get(1).and_then(|x| x.as_u64()).unwrap_or(0),
-                        ],
-                    );
-                }
-            }
-        }
-        if let Some(limits) = v.get("limits").and_then(|x| x.as_object()) {
-            for (agent, lv) in limits {
-                let windows: Vec<Window> = lv
-                    .get("w")
-                    .and_then(|x| x.as_array())
-                    .map(|arr| {
-                        arr.iter()
-                            .filter_map(|w| {
-                                let a = w.as_array()?;
-                                Some(Window {
-                                    label: a.first()?.as_str()?.to_string(),
-                                    pct: a.get(1)?.as_f64()?,
-                                    resets: a.get(2).and_then(|x| x.as_i64()).unwrap_or(0),
-                                })
-                            })
-                            .collect()
-                    })
-                    .unwrap_or_default();
-                c.limits.insert(
-                    agent.clone(),
-                    Snapshot {
-                        ts: lv.get("ts").and_then(|x| x.as_i64()).unwrap_or(0),
-                        checked: lv.get("ck").and_then(|x| x.as_i64()).unwrap_or(0),
-                        windows,
-                    },
-                );
-            }
-        }
-        if let Some(rounds) = v.get("rounds").and_then(|x| x.as_array()) {
-            for rv in rounds {
-                if let Some(a) = rv.as_array() {
-                    let gi = |i: usize| a.get(i).and_then(|x| x.as_i64()).unwrap_or(0);
-                    let gu = |i: usize| a.get(i).and_then(|x| x.as_u64()).unwrap_or(0);
-                    let gstr =
-                        |i: usize| a.get(i).and_then(|x| x.as_str()).unwrap_or("").to_string();
-                    c.rounds.push(Round {
-                        ts: gi(0),
-                        agent: gstr(1),
-                        model: gstr(2),
-                        speed: gstr(3),
-                        project: gstr(4),
-                        inp: gu(5),
-                        cread: gu(6),
-                        cw5: gu(7),
-                        cw1h: gu(8),
-                        out: gu(9),
-                    });
-                }
-            }
-        }
+        let data = compact_from_value_tolerant(&v);
+        c.agg = data.agg;
+        c.hours = data.hours;
+        c.rounds = data.rounds;
+        c.limits = data.limits;
         c
     }
 
+    pub fn compact_data(&self) -> CompactData {
+        CompactData {
+            agg: self.agg.clone(),
+            hours: self.hours.clone(),
+            rounds: self.rounds.clone(),
+            limits: self.limits.clone(),
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
     pub fn add(
         &mut self,
         date: &str,
@@ -298,10 +247,9 @@ impl Cache {
         self.dirty = true;
     }
 
-    /// Разовый пересбор недавнего окна (апгрейд со старых кэшей с неполным
-    /// почасовым агрегатом). Чистим hours/rounds полностью, дневной агрегат за
-    /// окно и состояния недавних файлов — чтобы скан перечитал их с нуля и
-    /// собрал hours/rounds/agg-recent консистентно. Старее окна — не трогаем.
+    /// Разовый пересбор выбранного окна. Чистим hours/rounds полностью, дневной
+    /// агрегат за окно и состояния файлов — чтобы скан перечитал их с нуля и
+    /// собрал hours/rounds/agg консистентно. Старее окна — не трогаем.
     pub fn reset_recent(&mut self, date_cutoff: &str, mtime_cutoff: i64) {
         self.hours.clear();
         self.rounds.clear();
@@ -400,58 +348,12 @@ impl Cache {
             }
             files.insert(k.clone(), Value::Object(o));
         }
-        let mut agg = Map::new();
-        for (k, c) in &self.agg {
-            agg.insert(
-                k.clone(),
-                Value::Array(c.iter().map(|n| (*n).into()).collect()),
-            );
-        }
-        let mut hours = Map::new();
-        for (k, c) in &self.hours {
-            hours.insert(
-                k.clone(),
-                Value::Array(c.iter().map(|n| (*n).into()).collect()),
-            );
-        }
-        let rounds: Vec<Value> = self
-            .rounds
-            .iter()
-            .map(|r| {
-                Value::Array(vec![
-                    r.ts.into(),
-                    r.agent.clone().into(),
-                    r.model.clone().into(),
-                    r.speed.clone().into(),
-                    r.project.clone().into(),
-                    r.inp.into(),
-                    r.cread.into(),
-                    r.cw5.into(),
-                    r.cw1h.into(),
-                    r.out.into(),
-                ])
-            })
-            .collect();
-        let mut limits = Map::new();
-        for (agent, s) in &self.limits {
-            let mut o = Map::new();
-            o.insert("ts".into(), s.ts.into());
-            o.insert("ck".into(), s.checked.into());
-            let w: Vec<Value> = s
-                .windows
-                .iter()
-                .map(|w| Value::Array(vec![w.label.clone().into(), w.pct.into(), w.resets.into()]))
-                .collect();
-            o.insert("w".into(), Value::Array(w));
-            limits.insert(agent.clone(), Value::Object(o));
-        }
-        let mut root = Map::new();
+        let mut root = compact_to_value(&self.compact_data())
+            .as_object()
+            .cloned()
+            .unwrap_or_default();
         root.insert("version".into(), CACHE_VERSION.into());
         root.insert("files".into(), Value::Object(files));
-        root.insert("agg".into(), Value::Object(agg));
-        root.insert("hours".into(), Value::Object(hours));
-        root.insert("rounds".into(), Value::Array(rounds));
-        root.insert("limits".into(), Value::Object(limits));
 
         if let Some(parent) = self.path.parent() {
             let _ = fs::create_dir_all(parent);
@@ -463,5 +365,464 @@ impl Cache {
             }
         }
         self.dirty = false;
+    }
+}
+
+pub fn compact_to_value(data: &CompactData) -> Value {
+    let agg = data
+        .agg
+        .iter()
+        .map(|(key, counts)| {
+            (
+                key.clone(),
+                Value::Array(counts.iter().map(|value| (*value).into()).collect()),
+            )
+        })
+        .collect();
+    let hours = data
+        .hours
+        .iter()
+        .map(|(key, counts)| {
+            (
+                key.clone(),
+                Value::Array(counts.iter().map(|value| (*value).into()).collect()),
+            )
+        })
+        .collect();
+    let rounds = data
+        .rounds
+        .iter()
+        .map(|round| {
+            Value::Array(vec![
+                round.ts.into(),
+                round.agent.clone().into(),
+                round.model.clone().into(),
+                round.speed.clone().into(),
+                round.project.clone().into(),
+                round.inp.into(),
+                round.cread.into(),
+                round.cw5.into(),
+                round.cw1h.into(),
+                round.out.into(),
+            ])
+        })
+        .collect();
+    let limits = data
+        .limits
+        .iter()
+        .map(|(agent, snapshot)| {
+            let windows = snapshot
+                .windows
+                .iter()
+                .map(|window| {
+                    Value::Array(vec![
+                        window.label.clone().into(),
+                        window.pct.into(),
+                        window.resets.into(),
+                    ])
+                })
+                .collect();
+            let mut value = Map::new();
+            value.insert("ts".into(), snapshot.ts.into());
+            value.insert("ck".into(), snapshot.checked.into());
+            value.insert("w".into(), Value::Array(windows));
+            (agent.clone(), Value::Object(value))
+        })
+        .collect();
+
+    let mut root = Map::new();
+    root.insert("agg".into(), Value::Object(agg));
+    root.insert("hours".into(), Value::Object(hours));
+    root.insert("rounds".into(), Value::Array(rounds));
+    root.insert("limits".into(), Value::Object(limits));
+    Value::Object(root)
+}
+
+pub fn compact_from_value(value: &Value) -> Result<CompactData, String> {
+    decode_compact(value, true)
+}
+
+fn compact_from_value_tolerant(value: &Value) -> CompactData {
+    decode_compact(value, false).unwrap_or_default()
+}
+
+fn decode_compact(value: &Value, strict: bool) -> Result<CompactData, String> {
+    let root = value
+        .as_object()
+        .ok_or_else(|| "compact data must be an object".to_string())?;
+    let mut data = CompactData::default();
+
+    match root.get("agg").and_then(Value::as_object) {
+        Some(values) => {
+            for (key, value) in values {
+                let Some(array) = value.as_array() else {
+                    if strict {
+                        return Err(format!("invalid aggregate {key}"));
+                    }
+                    continue;
+                };
+                if array.len() != 6 || (strict && !valid_aggregate_key(key)) {
+                    if strict {
+                        return Err(format!("invalid aggregate {key}"));
+                    }
+                    continue;
+                }
+                let Some(counts) = array_u64::<6>(array) else {
+                    if strict {
+                        return Err(format!("invalid aggregate {key}"));
+                    }
+                    continue;
+                };
+                if strict && !valid_counts(&counts) {
+                    return Err(format!("invalid aggregate {key}"));
+                }
+                data.agg.insert(key.clone(), counts);
+            }
+        }
+        None if strict => return Err("missing agg".to_string()),
+        None => {}
+    }
+
+    match root.get("hours").and_then(Value::as_object) {
+        Some(values) => {
+            for (key, value) in values {
+                let Some(array) = value.as_array() else {
+                    if strict {
+                        return Err(format!("invalid hour aggregate {key}"));
+                    }
+                    continue;
+                };
+                if array.len() != 2 || (strict && !valid_hour_key(key)) {
+                    if strict {
+                        return Err(format!("invalid hour aggregate {key}"));
+                    }
+                    continue;
+                }
+                let Some(counts) = array_u64::<2>(array) else {
+                    if strict {
+                        return Err(format!("invalid hour aggregate {key}"));
+                    }
+                    continue;
+                };
+                if strict && !valid_counts(&counts) {
+                    return Err(format!("invalid hour aggregate {key}"));
+                }
+                data.hours.insert(key.clone(), counts);
+            }
+        }
+        None if strict => return Err("missing hours".to_string()),
+        None => {}
+    }
+
+    match root.get("rounds").and_then(Value::as_array) {
+        Some(values) => {
+            for value in values {
+                let Some(array) = value.as_array() else {
+                    if strict {
+                        return Err("invalid round".to_string());
+                    }
+                    continue;
+                };
+                let round = decode_round(array);
+                match round {
+                    Some(round) if array.len() == 10 && (!strict || valid_round(&round)) => {
+                        data.rounds.push(round)
+                    }
+                    _ if strict => return Err("invalid round".to_string()),
+                    _ => {}
+                }
+            }
+        }
+        None if strict => return Err("missing rounds".to_string()),
+        None => {}
+    }
+
+    match root.get("limits").and_then(Value::as_object) {
+        Some(values) => {
+            for (agent, value) in values {
+                let snapshot = decode_snapshot(value, strict);
+                match snapshot {
+                    Ok(Some(snapshot)) => {
+                        data.limits.insert(agent.clone(), snapshot);
+                    }
+                    Ok(None) => {}
+                    Err(error) => return Err(format!("invalid limit {agent}: {error}")),
+                }
+            }
+        }
+        None if strict => return Err("missing limits".to_string()),
+        None => {}
+    }
+
+    Ok(data)
+}
+
+fn array_u64<const N: usize>(array: &[Value]) -> Option<[u64; N]> {
+    if array.len() != N {
+        return None;
+    }
+    let mut values = [0; N];
+    for (index, value) in array.iter().enumerate() {
+        values[index] = value.as_u64()?;
+    }
+    Some(values)
+}
+
+fn valid_counts(values: &[u64]) -> bool {
+    values
+        .iter()
+        .try_fold(0u64, |total, value| total.checked_add(*value))
+        .is_some_and(|total| total <= MAX_COMPACT_COUNT)
+}
+
+fn valid_aggregate_key(key: &str) -> bool {
+    let fields: Vec<_> = key.split(SEP).collect();
+    fields.len() == 5 && valid_date(fields[0])
+}
+
+fn valid_hour_key(key: &str) -> bool {
+    let fields: Vec<_> = key.split(SEP).collect();
+    fields.len() == 3 && valid_hour(fields[0])
+}
+
+fn valid_date(value: &str) -> bool {
+    let bytes = value.as_bytes();
+    if bytes.len() != 10
+        || !value.is_ascii()
+        || bytes[4] != b'-'
+        || bytes[7] != b'-'
+        || bytes
+            .iter()
+            .enumerate()
+            .any(|(index, byte)| !matches!(index, 4 | 7) && !byte.is_ascii_digit())
+    {
+        return false;
+    }
+    let month = value[5..7].parse::<u8>().ok();
+    let day = value[8..10].parse::<u8>().ok();
+    month.is_some_and(|month| (1..=12).contains(&month))
+        && day.is_some_and(|day| (1..=31).contains(&day))
+}
+
+fn valid_hour(value: &str) -> bool {
+    value.len() == 13
+        && value.is_ascii()
+        && valid_date(&value[..10])
+        && value.as_bytes()[10] == b' '
+        && value[11..13].parse::<u8>().is_ok_and(|hour| hour < 24)
+}
+
+fn valid_round(round: &Round) -> bool {
+    round.ts > 0 && valid_counts(&[round.inp, round.cread, round.cw5, round.cw1h, round.out])
+}
+
+fn decode_round(array: &[Value]) -> Option<Round> {
+    Some(Round {
+        ts: array.first()?.as_i64()?,
+        agent: array.get(1)?.as_str()?.to_string(),
+        model: array.get(2)?.as_str()?.to_string(),
+        speed: array.get(3)?.as_str()?.to_string(),
+        project: array.get(4)?.as_str()?.to_string(),
+        inp: array.get(5)?.as_u64()?,
+        cread: array.get(6)?.as_u64()?,
+        cw5: array.get(7)?.as_u64()?,
+        cw1h: array.get(8)?.as_u64()?,
+        out: array.get(9)?.as_u64()?,
+    })
+}
+
+fn decode_snapshot(value: &Value, strict: bool) -> Result<Option<Snapshot>, String> {
+    let Some(value) = value.as_object() else {
+        return if strict {
+            Err("snapshot must be an object".to_string())
+        } else {
+            Ok(None)
+        };
+    };
+    let ts = value.get("ts").and_then(Value::as_i64).unwrap_or(0);
+    let checked = value.get("ck").and_then(Value::as_i64).unwrap_or(0);
+    if strict && (ts < 0 || checked < 0) {
+        return Err("negative timestamp".to_string());
+    }
+    let Some(windows) = value.get("w").and_then(Value::as_array) else {
+        return if strict {
+            Err("missing windows".to_string())
+        } else {
+            Ok(Some(Snapshot {
+                ts,
+                checked,
+                windows: Vec::new(),
+            }))
+        };
+    };
+    let mut decoded = Vec::new();
+    for window in windows {
+        let Some(array) = window.as_array() else {
+            if strict {
+                return Err("window must be an array".to_string());
+            }
+            continue;
+        };
+        let parsed = (|| {
+            if array.len() != 3 {
+                return None;
+            }
+            let pct = array.get(1)?.as_f64()?;
+            if !pct.is_finite() || !(0.0..=100.0).contains(&pct) {
+                return None;
+            }
+            Some(Window {
+                label: array.first()?.as_str()?.to_string(),
+                pct,
+                resets: array.get(2)?.as_i64()?,
+            })
+        })();
+        match parsed {
+            Some(window) => decoded.push(window),
+            None if strict => return Err("invalid window".to_string()),
+            None => {}
+        }
+    }
+    Ok(Some(Snapshot {
+        ts,
+        checked,
+        windows: decoded,
+    }))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    fn sample_data() -> CompactData {
+        let mut data = CompactData::default();
+        data.agg.insert(
+            agg_key("2026-07-17", "claude", "opus", "standard", "/proj"),
+            [1, 2, 3, 4, 5, 6],
+        );
+        data.hours
+            .insert(format!("2026-07-17 19{SEP}claude{SEP}/proj"), [20, 1]);
+        data.rounds.push(Round {
+            ts: 1_784_317_200,
+            agent: "claude".into(),
+            model: "opus".into(),
+            speed: "standard".into(),
+            project: "/proj".into(),
+            inp: 2,
+            cread: 3,
+            cw5: 4,
+            cw1h: 5,
+            out: 6,
+        });
+        data.limits.insert(
+            "claude".into(),
+            Snapshot {
+                ts: 1_784_317_200,
+                checked: 1_784_317_200,
+                windows: vec![Window {
+                    label: "5h".into(),
+                    pct: 42.0,
+                    resets: 1_784_320_000,
+                }],
+            },
+        );
+        data
+    }
+
+    fn temp_path() -> PathBuf {
+        static NEXT: AtomicU64 = AtomicU64::new(0);
+        std::env::temp_dir().join(format!(
+            "tokmeter-cache-test-{}-{}.json",
+            std::process::id(),
+            NEXT.fetch_add(1, Ordering::Relaxed)
+        ))
+    }
+
+    #[test]
+    fn compact_round_trip_excludes_files() {
+        let data = sample_data();
+        let value = compact_to_value(&data);
+        assert!(value.get("files").is_none());
+        let decoded = compact_from_value(&value).unwrap();
+        assert_eq!(decoded.agg, data.agg);
+        assert_eq!(decoded.hours, data.hours);
+        assert_eq!(decoded.rounds, data.rounds);
+        assert_eq!(decoded.limits["claude"].windows[0].label, "5h");
+    }
+
+    #[test]
+    fn local_cache_schema_round_trips_with_files() {
+        let path = temp_path();
+        let data = sample_data();
+        let mut cache = Cache {
+            files: HashMap::from([("/session.jsonl".into(), FileState::default())]),
+            agg: data.agg.clone(),
+            hours: data.hours.clone(),
+            rounds: data.rounds.clone(),
+            limits: data.limits.clone(),
+            version: CACHE_VERSION,
+            dirty: true,
+            path: path.clone(),
+        };
+        cache.save();
+        let value: Value = serde_json::from_str(&fs::read_to_string(&path).unwrap()).unwrap();
+        assert_eq!(value["version"].as_u64(), Some(CACHE_VERSION));
+        assert!(value["files"].get("/session.jsonl").is_some());
+        let loaded = Cache::load(path.clone());
+        assert_eq!(loaded.agg, data.agg);
+        assert_eq!(loaded.rounds, data.rounds);
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn strict_decoder_rejects_malformed_shapes() {
+        for value in [
+            serde_json::json!({"agg": [], "hours": {}, "rounds": [], "limits": {}}),
+            serde_json::json!({"agg": {"bad": [1,2]}, "hours": {}, "rounds": [], "limits": {}}),
+            serde_json::json!({"agg": {}, "hours": {}, "rounds": [[1]], "limits": {}}),
+            serde_json::json!({"agg": {}, "hours": {}, "rounds": [], "limits": {"claude": {"w": [["5h", 120, 0]]}}}),
+        ] {
+            assert!(compact_from_value(&value).is_err());
+        }
+    }
+
+    #[test]
+    fn strict_decoder_rejects_unsafe_keys_and_counters() {
+        let data = sample_data();
+        let aggregate_key = data.agg.keys().next().unwrap().clone();
+        let hour_key = data.hours.keys().next().unwrap().clone();
+
+        let mut invalid_date = compact_to_value(&data);
+        let counts = invalid_date["agg"]
+            .as_object_mut()
+            .unwrap()
+            .remove(&aggregate_key)
+            .unwrap();
+        invalid_date["agg"].as_object_mut().unwrap().insert(
+            format!("é026-07-17{SEP}claude{SEP}opus{SEP}standard{SEP}/proj"),
+            counts,
+        );
+        assert!(compact_from_value(&invalid_date).is_err());
+
+        let mut invalid_hour = compact_to_value(&data);
+        let counts = invalid_hour["hours"]
+            .as_object_mut()
+            .unwrap()
+            .remove(&hour_key)
+            .unwrap();
+        invalid_hour["hours"]
+            .as_object_mut()
+            .unwrap()
+            .insert(format!("2026-07-17 99{SEP}claude{SEP}/proj"), counts);
+        assert!(compact_from_value(&invalid_hour).is_err());
+
+        let mut oversized = compact_to_value(&data);
+        oversized["agg"][&aggregate_key][1] = u64::MAX.into();
+        assert!(compact_from_value(&oversized).is_err());
+
+        let mut oversized_round = compact_to_value(&data);
+        oversized_round["rounds"][0][5] = u64::MAX.into();
+        assert!(compact_from_value(&oversized_round).is_err());
     }
 }

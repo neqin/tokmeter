@@ -77,6 +77,7 @@ impl Pricing {
         (self.def.input, self.def.output)
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub fn cost(
         &self,
         model: &str,

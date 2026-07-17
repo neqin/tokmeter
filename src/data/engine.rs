@@ -2,7 +2,9 @@
 //! Cache path and LOCK_NB flock match tok so both tools share one cursor.
 
 use super::cache::{Cache, CACHE_VERSION};
+use super::config::{Config, LimitsConfig, LocalSourcesConfig, RetentionConfig};
 use super::limits;
+use super::protocol::ExportRefreshStatus;
 use super::scan::Scanner;
 use super::timeutil::{local_day, local_offset, now_epoch, ymd_str};
 use std::env;
@@ -11,14 +13,6 @@ use std::io::ErrorKind;
 use std::os::unix::io::AsRawFd;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicI64, Ordering};
-
-/// Env defaults (same knobs as tok).
-pub fn env_i64(key: &str, default: i64) -> i64 {
-    env::var(key)
-        .ok()
-        .and_then(|s| s.parse().ok())
-        .unwrap_or(default)
-}
 
 pub fn cache_path(home: &str) -> PathBuf {
     if let Ok(d) = env::var("HERDR_PLUGIN_STATE_DIR") {
@@ -31,6 +25,20 @@ pub fn cache_path(home: &str) -> PathBuf {
         .filter(|s| !s.is_empty())
         .unwrap_or_else(|| format!("{home}/.cache"));
     Path::new(&base).join("tok").join("cache.json")
+}
+
+#[derive(Clone, Copy)]
+pub struct LocalRefreshOptions {
+    pub local_sources: LocalSourcesConfig,
+    pub limits: LimitsConfig,
+    pub retention: RetentionConfig,
+    pub limits_ttl_secs: i64,
+    pub reset: bool,
+}
+
+pub struct LocalRefreshOutcome {
+    pub cache: Cache,
+    pub refresh_status: ExportRefreshStatus,
 }
 
 struct CacheLock(File);
@@ -47,6 +55,7 @@ impl CacheLock {
             .read(true)
             .write(true)
             .create(true)
+            .truncate(false)
             .open(lock_path)?;
         let rc = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
         if rc != 0 {
@@ -80,12 +89,13 @@ fn refresh(
     history_days: i64,
     hours_days: i64,
     files_days: i64,
+    local_sources: LocalSourcesConfig,
 ) {
     let now = now_epoch();
     let off = local_offset(now);
     let min_mtime = now - (scan_days + 1) * 86400;
     let ring_min = now - hours_days * 86400;
-    let scanner = Scanner::new(home, min_mtime, off, ring_min);
+    let scanner = Scanner::new_with_sources(home, min_mtime, off, ring_min, local_sources);
     scanner.update(cache);
     let today = local_day(now, off);
     let agg_cutoff = ymd_str(today - history_days);
@@ -94,8 +104,7 @@ fn refresh(
     cache.prune(&agg_cutoff, &hours_cutoff, files_mtime_cutoff, ring_min);
 }
 
-/// Incremental scan + optional limits fetch + save. On lock contention returns
-/// a loaded cache without saving (read-only).
+#[cfg(test)]
 #[allow(clippy::too_many_arguments)]
 pub fn reload_refresh_save(
     state_path: &Path,
@@ -107,113 +116,149 @@ pub fn reload_refresh_save(
     limits_ttl: i64,
     reset: bool,
 ) -> Cache {
+    reload_refresh_save_options(
+        state_path,
+        home,
+        LocalRefreshOptions {
+            local_sources: LocalSourcesConfig::default(),
+            limits: LimitsConfig::default(),
+            retention: RetentionConfig {
+                scan_days,
+                history_days,
+                hours_days,
+                files_days,
+            },
+            limits_ttl_secs: limits_ttl,
+            reset,
+        },
+    )
+    .cache
+}
+
+pub fn reload_configured(
+    home: &str,
+    config: &Config,
+    limits_ttl_secs: i64,
+    reset: bool,
+) -> LocalRefreshOutcome {
+    reload_refresh_save_options(
+        &cache_path(home),
+        home,
+        LocalRefreshOptions {
+            local_sources: config.local_sources,
+            limits: config.limits,
+            retention: config.retention,
+            limits_ttl_secs,
+            reset,
+        },
+    )
+}
+
+fn reload_refresh_save_options(
+    state_path: &Path,
+    home: &str,
+    options: LocalRefreshOptions,
+) -> LocalRefreshOutcome {
     let lock = match CacheLock::acquire(state_path) {
-        Ok(lock) => Some(lock),
-        Err(e) => {
-            eprintln!("tokmeter: cache lock unavailable ({e}); read-only load");
-            return Cache::load(state_path.to_path_buf());
+        Ok(lock) => lock,
+        Err(error) => {
+            eprintln!("tokmeter: cache lock unavailable ({error}); read-only load");
+            return LocalRefreshOutcome {
+                cache: Cache::load(state_path.to_path_buf()),
+                refresh_status: ExportRefreshStatus::ReadOnly,
+            };
         }
     };
-    if reset {
+    if options.reset {
         reset_cache_files(state_path);
     }
     let mut cache = Cache::load(state_path.to_path_buf());
+    let retention = options.retention;
 
     let upgrade = (1..CACHE_VERSION).contains(&cache.version);
     if upgrade {
         let now = now_epoch();
         let off = local_offset(now);
-        let date_cutoff = ymd_str(local_day(now, off) - hours_days);
-        let mtime_cutoff = now - hours_days * 86400;
-        eprintln!("tokmeter: one-shot hourly rebuild…");
+        let date_cutoff = ymd_str(local_day(now, off) - retention.history_days);
+        let mtime_cutoff = now - (retention.history_days + 1) * 86400;
+        eprintln!("tokmeter: one-shot history rebuild…");
         cache.reset_recent(&date_cutoff, mtime_cutoff);
     }
 
-    if cache.version == 0 || upgrade {
-        refresh(
-            &mut cache,
-            home,
-            history_days,
-            history_days,
-            hours_days,
-            files_days,
-        );
+    let scan_days = if cache.version == 0 || upgrade {
+        retention.history_days
     } else {
-        refresh(
-            &mut cache,
-            home,
-            scan_days,
-            history_days,
-            hours_days,
-            files_days,
-        );
+        retention.scan_days
+    };
+    refresh(
+        &mut cache,
+        home,
+        scan_days,
+        retention.history_days,
+        retention.hours_days,
+        retention.files_days,
+        options.local_sources,
+    );
+    refresh_limits(&mut cache, home, options.limits_ttl_secs, options.limits);
+    cache.save();
+    drop(lock);
+    LocalRefreshOutcome {
+        cache,
+        refresh_status: ExportRefreshStatus::Fresh,
     }
+}
 
-    if limits_ttl > 0 {
-        static LAST_CLAUDE_FETCH: AtomicI64 = AtomicI64::new(0);
-        static LAST_CODEX_FETCH: AtomicI64 = AtomicI64::new(0);
-        static LAST_GROK_FETCH: AtomicI64 = AtomicI64::new(0);
-        let now = now_epoch();
+fn refresh_limits(cache: &mut Cache, home: &str, limits_ttl: i64, enabled: LimitsConfig) {
+    if limits_ttl <= 0 {
+        return;
+    }
+    static LAST_CLAUDE_FETCH: AtomicI64 = AtomicI64::new(0);
+    static LAST_CODEX_FETCH: AtomicI64 = AtomicI64::new(0);
+    static LAST_GROK_FETCH: AtomicI64 = AtomicI64::new(0);
+    let now = now_epoch();
+    if enabled.claude {
         let checked = cache
             .limits
             .get("claude")
-            .map_or(0, |s| s.checked)
+            .map_or(0, |snapshot| snapshot.checked)
             .max(LAST_CLAUDE_FETCH.load(Ordering::Relaxed));
         if now - checked >= limits_ttl {
             LAST_CLAUDE_FETCH.store(now, Ordering::Relaxed);
             cache.touch_limits("claude", now);
-            if let Some(snap) = limits::fetch_claude(home, now) {
-                cache.set_limits("claude", snap);
+            if let Some(snapshot) = limits::fetch_claude(home, now) {
+                cache.set_limits("claude", snapshot);
             }
         }
+    }
+    if enabled.codex {
         let checked = cache
             .limits
             .get("codex")
-            .map_or(0, |s| s.checked)
+            .map_or(0, |snapshot| snapshot.checked)
             .max(LAST_CODEX_FETCH.load(Ordering::Relaxed));
         if now - checked >= limits_ttl {
             LAST_CODEX_FETCH.store(now, Ordering::Relaxed);
             cache.touch_limits("codex", now);
-            if let Some(snap) = limits::fetch_codex(home, now) {
-                cache.set_limits("codex", snap);
+            if let Some(snapshot) = limits::fetch_codex(home, now) {
+                cache.set_limits("codex", snapshot);
             }
         }
+    }
+    if enabled.grok {
         let checked = cache
             .limits
             .get("grok")
-            .map_or(0, |s| s.checked)
+            .map_or(0, |snapshot| snapshot.checked)
             .max(LAST_GROK_FETCH.load(Ordering::Relaxed));
         if now - checked >= limits_ttl {
             LAST_GROK_FETCH.store(now, Ordering::Relaxed);
             cache.touch_limits("grok", now);
-            let prev = cache.limits.get("grok").cloned();
-            if let Some(snap) = limits::fetch_grok(home, now, prev.as_ref()) {
-                cache.set_limits("grok", snap);
+            let previous = cache.limits.get("grok").cloned();
+            if let Some(snapshot) = limits::fetch_grok(home, now, previous.as_ref()) {
+                cache.set_limits("grok", snapshot);
             }
         }
     }
-    cache.save();
-    drop(lock);
-    cache
-}
-
-/// Convenience: reload using env defaults.
-pub fn reload_default(home: &str, limits_ttl: i64, reset: bool) -> Cache {
-    let state = cache_path(home);
-    let scan_days = env_i64("TOK_WINDOW_DAYS", 8).max(1);
-    let history_days = env_i64("TOK_HISTORY_DAYS", 120).max(scan_days);
-    let hours_days = env_i64("TOK_HOURS_DAYS", 8).max(1);
-    let files_days = env_i64("TOK_FILES_DAYS", 14).max(scan_days);
-    reload_refresh_save(
-        &state,
-        home,
-        scan_days,
-        history_days,
-        hours_days,
-        files_days,
-        limits_ttl,
-        reset,
-    )
 }
 
 #[cfg(test)]
@@ -233,10 +278,7 @@ mod tests {
         env::set_var("XDG_CACHE_HOME", "/tmp/tokmeter-test-cache");
         env::remove_var("HERDR_PLUGIN_STATE_DIR");
         let p = cache_path("/home/user");
-        assert!(
-            p.ends_with("tok/cache.json"),
-            "path={p:?}"
-        );
+        assert!(p.ends_with("tok/cache.json"), "path={p:?}");
         assert!(p.to_string_lossy().contains("tokmeter-test-cache"));
         env::remove_var("XDG_CACHE_HOME");
     }
@@ -275,6 +317,54 @@ mod tests {
         );
         env::remove_var("HERDR_PLUGIN_STATE_DIR");
         let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn lock_contention_returns_read_only() {
+        let dir = tempfile_dir();
+        let state = dir.join("cache.json");
+        let lock = CacheLock::acquire(&state).unwrap();
+        let outcome = reload_refresh_save_options(
+            &state,
+            dir.to_str().unwrap(),
+            LocalRefreshOptions {
+                local_sources: LocalSourcesConfig::default(),
+                limits: LimitsConfig::default(),
+                retention: RetentionConfig::default(),
+                limits_ttl_secs: 0,
+                reset: false,
+            },
+        );
+        assert_eq!(outcome.refresh_status, ExportRefreshStatus::ReadOnly);
+        drop(lock);
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn disabled_limit_providers_are_not_touched() {
+        let dir = tempfile_dir();
+        let state = dir.join("cache.json");
+        let outcome = reload_refresh_save_options(
+            &state,
+            dir.to_str().unwrap(),
+            LocalRefreshOptions {
+                local_sources: LocalSourcesConfig {
+                    claude: false,
+                    codex: false,
+                    omp: false,
+                },
+                limits: LimitsConfig {
+                    claude: false,
+                    codex: false,
+                    grok: false,
+                },
+                retention: RetentionConfig::default(),
+                limits_ttl_secs: 5,
+                reset: false,
+            },
+        );
+        assert!(outcome.cache.limits.is_empty());
+        let _ = fs::remove_dir_all(dir);
     }
 
     fn tempfile_dir() -> PathBuf {
