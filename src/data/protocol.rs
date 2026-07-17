@@ -158,6 +158,13 @@ pub fn decode_json(
             .ok_or_else(|| invalid("missing compact data"))?,
     )
     .map_err(invalid)?;
+    if data
+        .rounds
+        .iter()
+        .any(|round| round.ts > generated_at.saturating_add(MAX_FUTURE_SECS))
+    {
+        return Err(invalid("invalid round timestamp"));
+    }
 
     let mut warnings = Vec::new();
     if retention.history_days < local_retention.history_days
@@ -346,6 +353,13 @@ mod tests {
         malformed["data"]["agg"] = Value::Array(Vec::new());
         assert_eq!(
             decode(malformed).err().unwrap().kind,
+            ProtocolErrorKind::Invalid
+        );
+
+        let mut future_round = sample_snapshot().to_value();
+        future_round["data"]["rounds"][0][0] = i64::MAX.into();
+        assert_eq!(
+            decode(future_round).err().unwrap().kind,
             ProtocolErrorKind::Invalid
         );
     }

@@ -381,3 +381,8 @@ specification, or CHANGELOG again.
   counters are bounded, aggregate sums saturate, RemoteStore writes lock and
   merge dirty sources, retention warnings are derived at view time, public JSON
   omits installation IDs, and the full branch diff passes whitespace checks.
+- 2026-07-18: Final branch review round 2 findings were addressed: remote round
+  timestamps are bounded by snapshot generation time, later successful attempts
+  replace older snapshots even after clock correction, and saving one completed
+  source preserves other in-flight `connecting` states in memory. The release
+  gate passes with 78 tests.

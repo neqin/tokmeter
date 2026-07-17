@@ -196,6 +196,15 @@ impl RemoteStore {
                 "remote cache is invalid; remove it before saving",
             ));
         }
+        let connecting: Vec<_> = self
+            .sources
+            .iter()
+            .filter(|(source_id, source)| {
+                source.health == SourceHealth::Connecting
+                    && !self.dirty_sources.contains(source_id.as_str())
+            })
+            .map(|(source_id, source)| (source_id.clone(), source.clone()))
+            .collect();
         let _lock = RemoteStoreLock::acquire(&self.path)?;
         let mut merged = load_sources_for_merge(&self.path)?;
         for source_id in &self.dirty_sources {
@@ -209,8 +218,14 @@ impl RemoteStore {
             merged.insert(source_id.clone(), source);
         }
         self.sources = merged;
-        let text = serde_json::to_vec(&self.to_value())?;
-        private_io::atomic_write_private(&self.path, &text)?;
+        let write_result = (|| {
+            let text = serde_json::to_vec(&self.to_value())?;
+            private_io::atomic_write_private(&self.path, &text)
+        })();
+        for (source_id, source) in connecting {
+            self.sources.insert(source_id, source);
+        }
+        write_result?;
         self.dirty_sources.clear();
         Ok(())
     }
@@ -288,6 +303,9 @@ fn merge_source(existing: StoredSource, mut update: StoredSource) -> StoredSourc
     if update.last_attempt < existing.last_attempt {
         return existing;
     }
+    let update_is_success = update.health == SourceHealth::Healthy
+        && update.snapshot.is_some()
+        && update.last_success == update.last_attempt;
     let existing_last_success = existing.last_success;
     let existing_generated = existing
         .snapshot
@@ -299,7 +317,9 @@ fn merge_source(existing: StoredSource, mut update: StoredSource) -> StoredSourc
         .as_ref()
         .map(|snapshot| snapshot.generated_at)
         .unwrap_or(0);
-    if existing_last_success > update.last_success || existing_generated > update_generated {
+    if !update_is_success
+        && (existing_last_success > update.last_success || existing_generated > update_generated)
+    {
         update.instance_id = existing.instance_id;
         update.snapshot = existing.snapshot;
         update.warnings = existing.warnings;
@@ -634,6 +654,48 @@ mod tests {
         assert_eq!(loaded.sources["one"].last_success, NOW + 1);
         assert_eq!(loaded.sources["one"].health, SourceHealth::Stale);
         assert!(loaded.sources.contains_key("two"));
+        let _ = fs::remove_file(path.with_extension("json.lock"));
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn later_success_replaces_snapshot_with_earlier_generated_time() {
+        let path = temp_path("clock-correction");
+        let mut seed = store(path.clone());
+        seed.apply_success("lxc", "LXC", snapshot(ID1), Vec::new(), NOW, 1);
+        seed.save().unwrap();
+
+        let mut loaded = RemoteStore::load_path(path.clone(), NOW, retention());
+        let mut replacement = snapshot(ID2);
+        replacement.generated_at = NOW - 60;
+        loaded.apply_success("lxc", "LXC", replacement, Vec::new(), NOW + 1, 1);
+        loaded.save().unwrap();
+
+        let reloaded = RemoteStore::load_path(path.clone(), NOW + 1, retention());
+        assert_eq!(reloaded.sources["lxc"].instance_id, ID2);
+        assert_eq!(reloaded.sources["lxc"].last_success, NOW + 1);
+        let _ = fs::remove_file(path.with_extension("json.lock"));
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn save_preserves_other_sources_connecting_in_memory() {
+        let path = temp_path("connecting-batch");
+        let mut seed = store(path.clone());
+        seed.apply_success("one", "ONE", snapshot(ID1), Vec::new(), NOW, 1);
+        seed.apply_success("two", "TWO", snapshot(ID2), Vec::new(), NOW, 1);
+        seed.save().unwrap();
+
+        let mut loaded = RemoteStore::load_path(path.clone(), NOW, retention());
+        loaded.set_connecting("one", "ONE", NOW + 1);
+        loaded.set_connecting("two", "TWO", NOW + 1);
+        loaded.apply_success("one", "ONE", snapshot(ID1), Vec::new(), NOW + 1, 1);
+        loaded.save().unwrap();
+
+        assert_eq!(loaded.sources["two"].health, SourceHealth::Connecting);
+        assert_eq!(loaded.sources["two"].last_attempt, NOW + 1);
+        let persisted = RemoteStore::load_path(path.clone(), NOW + 1, retention());
+        assert_eq!(persisted.sources["two"].health, SourceHealth::Healthy);
         let _ = fs::remove_file(path.with_extension("json.lock"));
         let _ = fs::remove_file(path);
     }
