@@ -1,6 +1,7 @@
 # Changelog
 
 ## [Unreleased]
+- feat: custom client-side titlebar with brand, version, clock, and window controls
 
 ## 0.1.9 — 2026-07-18
 - feat: collect remote Claude, Codex, and OMP statistics over SSH

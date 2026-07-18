@@ -1,6 +1,7 @@
 //! GPUI tokmeter — token spend panel with real tok data layer.
 
 mod data;
+mod frame;
 
 use data::agg::{self, SourceScope, Timeframe, Tot};
 use data::cache::{Cache, CACHE_VERSION};
@@ -19,8 +20,8 @@ use data::timeutil::{
 use gpui::{
     actions, canvas, div, fill, point, prelude::*, px, relative, rgb, size, AnyElement, App,
     AppContext, Bounds, Context, FocusHandle, Focusable, InteractiveElement, KeyBinding,
-    ParentElement, Pixels, SharedString, StatefulInteractiveElement, Styled, Window,
-    WindowBackgroundAppearance, WindowBounds, WindowOptions,
+    MouseButton, ParentElement, Pixels, SharedString, StatefulInteractiveElement, Styled, Window,
+    WindowBackgroundAppearance, WindowBounds, WindowDecorations, WindowOptions,
 };
 use gpui_platform::application;
 use std::env;
@@ -52,11 +53,15 @@ fn cost_hi() -> gpui::Rgba {
 fn cost_lo() -> gpui::Rgba {
     rgb(0x5ecf8a)
 }
+fn border() -> gpui::Rgba {
+    rgb(0x2a2a30)
+}
 fn bar_colors() -> [u32; 6] {
     [0x8b4513, 0xb85c1a, 0xd97706, 0xea8c10, 0xf5a623, 0xffc107]
 }
 
 const MONO: &str = "JetBrains Mono";
+const TITLEBAR_HEIGHT: f32 = 34.0;
 const UI_W: f32 = 560.0;
 const UI_H: f32 = 920.0;
 const CHART_H: f32 = 140.0;
@@ -1585,14 +1590,90 @@ impl Dashboard {
                     .when_some(dot, |element, dot| element.child(dot))
                     .child(label)
             }))
+    }
+
+    fn render_titlebar(&self, window: &Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let button = |id: &'static str, glyph: &'static str, danger: bool| {
+            div()
+                .id(id)
+                .flex()
+                .items_center()
+                .justify_center()
+                .size(px(20.))
+                .rounded(px(4.))
+                .cursor_pointer()
+                .font_family(MONO)
+                .text_xs()
+                .text_color(muted())
+                .hover(move |style| style.bg(if danger { cost_hi() } else { border() }))
+                // Stop the mouse-down from starting a window move on the bar.
+                .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+                .child(glyph)
+        };
+        let bar = div()
+            .flex()
+            .flex_row()
+            .items_center()
+            .flex_shrink_0()
+            .h(px(TITLEBAR_HEIGHT))
+            .px_3()
+            .bg(bg())
+            .border_b_1()
+            .border_color(border())
+            .on_mouse_down(
+                MouseButton::Left,
+                cx.listener(|_, _, window, _| window.start_window_move()),
+            )
+            .child(
+                div()
+                    .flex()
+                    .items_center()
+                    .gap_2()
+                    .child(div().size(px(7.)).rounded_full().bg(accent()))
+                    .child(
+                        div()
+                            .flex()
+                            .items_baseline()
+                            .gap_1()
+                            .font_family(MONO)
+                            .child(
+                                div()
+                                    .text_sm()
+                                    .font_weight(gpui::FontWeight::BOLD)
+                                    .text_color(text())
+                                    .child("tokmeter"),
+                            )
+                            .child(
+                                div()
+                                    .text_xs()
+                                    .text_color(dim())
+                                    .child(concat!("v", env!("CARGO_PKG_VERSION"))),
+                            ),
+                    ),
+            )
             .child(div().flex_1())
             .child(
                 div()
-                    .font_family(MONO)
-                    .text_sm()
-                    .text_color(muted())
-                    .child(self.snapshot.clock.clone()),
-            )
+                    .flex()
+                    .items_center()
+                    .gap_2()
+                    .child(
+                        div()
+                            .font_family(MONO)
+                            .text_xs()
+                            .text_color(muted())
+                            .child(self.snapshot.clock.clone()),
+                    )
+                    .child(
+                        button("titlebar-min", "—", false)
+                            .on_click(cx.listener(|_, _, window, _| window.minimize_window())),
+                    )
+                    .child(
+                        button("titlebar-close", "✕", true)
+                            .on_click(cx.listener(|_, _, _, cx| cx.quit())),
+                    ),
+            );
+        frame::rounded(bar, frame::FrameCorners::Top, window)
     }
 
     fn render_period(&self, cx: &mut Context<Self>) -> impl IntoElement {
@@ -2126,58 +2207,23 @@ impl Render for Dashboard {
             window.focus(&self.focus_handle, cx);
         }
 
-        div()
-            .id("dashboard")
-            .track_focus(&self.focus_handle)
-            .key_context("Dashboard")
-            .size_full()
-            .bg(bg())
-            .text_color(text())
+        let body = div()
+            .id("dashboard-body")
             .flex()
             .flex_col()
+            .flex_1()
+            .min_h_0()
             .p_4()
             .gap_3()
-            .on_action(cx.listener(|this, _: &NextTab, _, cx| {
-                this.handle_key(DashboardKey::TabNext);
-                cx.notify();
-            }))
-            .on_action(cx.listener(|this, _: &PrevTab, _, cx| {
-                this.handle_key(DashboardKey::TabPrev);
-                cx.notify();
-            }))
-            .on_action(cx.listener(|this, _: &PeriodLeft, _, cx| {
-                this.handle_key(DashboardKey::Left);
-                cx.notify();
-            }))
-            .on_action(cx.listener(|this, _: &PeriodRight, _, cx| {
-                this.handle_key(DashboardKey::Right);
-                cx.notify();
-            }))
-            .on_action(cx.listener(|this, _: &SourceNext, _, cx| {
-                this.handle_key(DashboardKey::SourceNext);
-                cx.notify();
-            }))
-            .on_action(cx.listener(|this, _: &SourcePrev, _, cx| {
-                this.handle_key(DashboardKey::SourcePrev);
-                cx.notify();
-            }))
-            .on_action(cx.listener(|this, _: &ForceRefresh, _, cx| {
-                this.handle_key(DashboardKey::Refresh);
-                this.remote_refresh.request_force();
-                this.reload_config();
-                this.schedule_reload(cx, false);
-                this.schedule_remote_refresh(cx);
-                cx.notify();
-            }))
             .when(self.tab != Tab::Sources, |d| {
                 d.child(self.render_source_filter(cx))
             })
             .child(self.render_source_status())
-            .child(div().h(px(1.)).w_full().bg(rgb(0x2a2a30)))
+            .child(div().h(px(1.)).w_full().bg(border()))
             .child(self.render_limits())
-            .child(div().h(px(1.)).w_full().bg(rgb(0x2a2a30)))
+            .child(div().h(px(1.)).w_full().bg(border()))
             .child(self.render_tabbar(cx))
-            .child(div().h(px(1.)).w_full().bg(rgb(0x2a2a30)))
+            .child(div().h(px(1.)).w_full().bg(border()))
             .when_some(self.status.clone(), |d, st| {
                 d.child(
                     div()
@@ -2226,7 +2272,54 @@ impl Render for Dashboard {
                     .text_xs()
                     .text_color(dim())
                     .child("Tab tabs · ←→ period/agent · s source · r refresh"),
-            )
+            );
+
+        let content = div()
+            .id("dashboard")
+            .track_focus(&self.focus_handle)
+            .key_context("Dashboard")
+            .size_full()
+            .bg(bg())
+            .text_color(text())
+            .flex()
+            .flex_col()
+            .on_action(cx.listener(|this, _: &NextTab, _, cx| {
+                this.handle_key(DashboardKey::TabNext);
+                cx.notify();
+            }))
+            .on_action(cx.listener(|this, _: &PrevTab, _, cx| {
+                this.handle_key(DashboardKey::TabPrev);
+                cx.notify();
+            }))
+            .on_action(cx.listener(|this, _: &PeriodLeft, _, cx| {
+                this.handle_key(DashboardKey::Left);
+                cx.notify();
+            }))
+            .on_action(cx.listener(|this, _: &PeriodRight, _, cx| {
+                this.handle_key(DashboardKey::Right);
+                cx.notify();
+            }))
+            .on_action(cx.listener(|this, _: &SourceNext, _, cx| {
+                this.handle_key(DashboardKey::SourceNext);
+                cx.notify();
+            }))
+            .on_action(cx.listener(|this, _: &SourcePrev, _, cx| {
+                this.handle_key(DashboardKey::SourcePrev);
+                cx.notify();
+            }))
+            .on_action(cx.listener(|this, _: &ForceRefresh, _, cx| {
+                this.handle_key(DashboardKey::Refresh);
+                this.remote_refresh.request_force();
+                this.reload_config();
+                this.schedule_reload(cx, false);
+                this.schedule_remote_refresh(cx);
+                cx.notify();
+            }))
+            .child(self.render_titlebar(window, cx))
+            .child(body)
+            .into_any_element();
+
+        frame::window_frame(content, window)
     }
 }
 
@@ -2466,7 +2559,10 @@ fn main() {
                 window_bounds: Some(WindowBounds::Windowed(bounds)),
                 window_min_size: Some(size(px(420.), px(480.))),
                 app_id: Some("tokmeter".into()),
-                window_background: WindowBackgroundAppearance::Opaque,
+                titlebar: None,
+                is_resizable: true,
+                window_decorations: Some(WindowDecorations::Client),
+                window_background: WindowBackgroundAppearance::Transparent,
                 focus: true,
                 show: true,
                 ..Default::default()
