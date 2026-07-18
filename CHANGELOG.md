@@ -4,6 +4,9 @@
 - fix: skip expired grok cached auth before billing rpc
 - feat: collect remote Claude, Codex, and OMP statistics over SSH
 - fix: harden remote snapshot collection
+- feat: add Sources tab with per-source status and loaded-data summary
+- feat: mark Sources tab health with a green/red dot instead of a header row
+- change: show account limits for the local machine only
 
 ## 0.1.8 — 2026-07-11
 - fix: avoid counting inherited Codex subagent history

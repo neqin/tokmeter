@@ -134,6 +134,14 @@ struct SourceOwned {
     last_success: i64,
     duration_ms: u64,
     error: String,
+    summary: Option<SourceSummary>,
+}
+
+#[derive(Clone)]
+struct SourceSummary {
+    projects: usize,
+    rounds: u64,
+    tokens: u64,
 }
 
 #[derive(Clone, Default)]
@@ -288,8 +296,10 @@ fn build_snapshot(
             cost: round.cost,
         })
         .collect();
+    // Account limits are only meaningful for the local machine; they are shown
+    // regardless of the selected source filter.
     let mut limits_owned = Vec::new();
-    for view in dataset.selected(source_filter)? {
+    for view in dataset.selected(&SourceFilter::Local)? {
         limits_owned.extend(
             limits::rows(|agent| view.limits.get(agent).cloned(), now)
                 .into_iter()
@@ -309,9 +319,41 @@ fn build_snapshot(
                 }),
         );
     }
-    let sources = dataset
-        .sources()
-        .map(|source| SourceOwned {
+    let mut sources = Vec::new();
+    for source in dataset.sources() {
+        // Whole-snapshot per-source summary. projects_view_dataset already sums
+        // per-source tokens safely; the unbounded All-timeframe token/chart path
+        // in build_dataset is intentionally avoided (it slices raw agg keys).
+        let summary = if source.active {
+            let filter = if source.local {
+                SourceFilter::Local
+            } else {
+                SourceFilter::Remote(source.id.clone())
+            };
+            let (projects, total) = agg::projects_view_dataset(
+                dataset,
+                &filter,
+                pricing,
+                Timeframe::All,
+                today,
+                usize::MAX,
+            )?;
+            // rounds_total is only defined for windowed timeframes; count the
+            // round records physically present in the snapshot instead.
+            let rounds = dataset
+                .selected(&filter)?
+                .iter()
+                .map(|view| view.rounds.len() as u64)
+                .sum();
+            Some(SourceSummary {
+                projects: projects.len(),
+                rounds,
+                tokens: total.tokens(),
+            })
+        } else {
+            None
+        };
+        sources.push(SourceOwned {
             id: source.id.clone(),
             label: source.label.clone(),
             local: source.local,
@@ -323,8 +365,9 @@ fn build_snapshot(
             last_success: source.last_success,
             duration_ms: source.duration_ms,
             error: source.error.clone(),
-        })
-        .collect();
+            summary,
+        });
+    }
 
     Ok(ViewSnapshot {
         tf,
@@ -456,6 +499,11 @@ fn snapshot_to_json(snap: &ViewSnapshot, mode: &str) -> serde_json::Value {
                 "last_success": source.last_success,
                 "duration_ms": source.duration_ms,
                 "error": source.error,
+                "summary": source.summary.as_ref().map(|s| serde_json::json!({
+                    "projects": s.projects,
+                    "rounds": s.rounds,
+                    "tokens": s.tokens,
+                })),
             })
         })
         .collect();
@@ -506,6 +554,36 @@ fn snapshot_to_json(snap: &ViewSnapshot, mode: &str) -> serde_json::Value {
 fn is_synthetic_label(label: &str) -> bool {
     let t = label.trim();
     t.eq_ignore_ascii_case("<synthetic>") || t.eq_ignore_ascii_case("synthetic")
+}
+
+/// Footer totals for the Sources tab: (active count, projects, rounds, tokens).
+/// Only sources with an active snapshot (a present summary) contribute.
+fn sources_totals(sources: &[SourceOwned]) -> (u64, usize, u64, u64) {
+    let mut active = 0u64;
+    let (mut projects, mut rounds, mut tokens) = (0usize, 0u64, 0u64);
+    for source in sources {
+        if let Some(summary) = &source.summary {
+            active += 1;
+            projects = projects.saturating_add(summary.projects);
+            rounds = rounds.saturating_add(summary.rounds);
+            tokens = tokens.saturating_add(summary.tokens);
+        }
+    }
+    (active, projects, rounds, tokens)
+}
+
+/// Whether every source is in a good state. A single problematic source turns
+/// the Sources tab dot red.
+fn sources_health_ok(sources: &[SourceOwned]) -> bool {
+    sources.iter().all(|source| {
+        !matches!(
+            source.health,
+            SourceHealth::Error
+                | SourceHealth::Stale
+                | SourceHealth::Incompatible
+                | SourceHealth::DuplicateInstance
+        )
+    })
 }
 
 fn ftok(n: u64) -> String {
@@ -591,29 +669,33 @@ enum Tab {
     Global,
     Projects,
     Rounds,
+    Sources,
 }
 
 impl Tab {
-    const ALL: [Tab; 3] = [Tab::Global, Tab::Projects, Tab::Rounds];
+    const ALL: [Tab; 4] = [Tab::Global, Tab::Projects, Tab::Rounds, Tab::Sources];
     fn label(self) -> &'static str {
         match self {
             Tab::Global => "Usage",
             Tab::Projects => "Projects",
             Tab::Rounds => "Rounds",
+            Tab::Sources => "Sources",
         }
     }
     fn next(self) -> Tab {
         match self {
             Tab::Global => Tab::Projects,
             Tab::Projects => Tab::Rounds,
-            Tab::Rounds => Tab::Global,
+            Tab::Rounds => Tab::Sources,
+            Tab::Sources => Tab::Global,
         }
     }
     fn prev(self) -> Tab {
         match self {
-            Tab::Global => Tab::Rounds,
+            Tab::Global => Tab::Sources,
             Tab::Projects => Tab::Global,
             Tab::Rounds => Tab::Projects,
+            Tab::Sources => Tab::Rounds,
         }
     }
 }
@@ -1096,6 +1178,7 @@ impl Dashboard {
             DashboardKey::TabNext => self.tab = self.tab.next(),
             DashboardKey::TabPrev => self.tab = self.tab.prev(),
             DashboardKey::Left => match self.tab {
+                Tab::Sources => {}
                 Tab::Rounds => {
                     self.round_agent_idx = self.round_agent_idx.saturating_sub(1);
                     self.rebuild_from_cache();
@@ -1111,6 +1194,7 @@ impl Dashboard {
                 }
             },
             DashboardKey::Right => match self.tab {
+                Tab::Sources => {}
                 Tab::Rounds => {
                     self.round_agent_idx =
                         (self.round_agent_idx + 1).min(agg::ROUND_AGENTS.len() - 1);
@@ -1126,16 +1210,17 @@ impl Dashboard {
                     }
                 }
             },
-            DashboardKey::SourceNext => {
+            DashboardKey::SourceNext if self.tab != Tab::Sources => {
                 self.source_filter =
                     cycle_source_filter(&self.source_filter, &self.snapshot.sources, true);
                 self.rebuild_from_cache();
             }
-            DashboardKey::SourcePrev => {
+            DashboardKey::SourcePrev if self.tab != Tab::Sources => {
                 self.source_filter =
                     cycle_source_filter(&self.source_filter, &self.snapshot.sources, false);
                 self.rebuild_from_cache();
             }
+            DashboardKey::SourceNext | DashboardKey::SourcePrev => {}
             DashboardKey::Refresh => {
                 self.force_refresh = true;
             }
@@ -1239,8 +1324,9 @@ impl Dashboard {
             }))
     }
 
+    /// Per-source health is shown as a colored dot on the Sources tab; here we
+    /// only surface config/identity/remote-store diagnostics when present.
     fn render_source_status(&self) -> impl IntoElement {
-        let now = now_epoch();
         let diagnostics = [
             self.snapshot.diagnostics.config.as_deref(),
             self.snapshot.diagnostics.identity.as_deref(),
@@ -1250,49 +1336,95 @@ impl Dashboard {
         .flatten()
         .collect::<Vec<_>>()
         .join(" · ");
+        div().when(!diagnostics.is_empty(), |element| {
+            element.child(
+                div()
+                    .font_family(MONO)
+                    .text_xs()
+                    .text_color(cost_hi())
+                    .child(diagnostics),
+            )
+        })
+    }
+
+    fn render_sources_tab(&self) -> impl IntoElement {
+        let now = now_epoch();
+        let sources = &self.snapshot.sources;
+        let (active, proj_t, rnd_t, tok_t) = sources_totals(sources);
         div()
             .flex()
             .flex_col()
-            .gap_0p5()
+            .gap_2()
             .w_full()
-            .child(
+            .children(sources.iter().map(|source| {
+                let color = source_health_color(source.health);
+                let ssh = if source.local {
+                    "scan".to_string()
+                } else if source.duration_ms > 0 {
+                    format!("{}ms", source.duration_ms)
+                } else {
+                    "—".to_string()
+                };
+                let summary = match &source.summary {
+                    Some(s) => {
+                        format!(
+                            "{} proj · {} rnd · {} tok",
+                            s.projects,
+                            s.rounds,
+                            ftok(s.tokens)
+                        )
+                    }
+                    None => "—".to_string(),
+                };
                 div()
-                    .id("source-status-scroll")
                     .flex()
-                    .items_center()
-                    .gap_3()
-                    .w_full()
-                    .overflow_x_scroll()
-                    .children(self.snapshot.sources.iter().map(|source| {
-                        let color = source_health_color(source.health);
+                    .flex_col()
+                    .gap_0p5()
+                    .font_family(MONO)
+                    .text_xs()
+                    // Line 1: health, adaptive — the health text truncates so the
+                    // row never overflows a narrow window; ssh stays pinned right.
+                    .child(
                         div()
                             .flex()
                             .items_center()
-                            .gap_1()
-                            .font_family(MONO)
-                            .text_xs()
+                            .gap_2()
+                            .w_full()
                             .child(
                                 div()
                                     .text_color(color)
                                     .child(source_health_icon(source.health)),
                             )
-                            .child(div().text_color(text()).child(source.label.clone()))
                             .child(
                                 div()
+                                    .flex_shrink_0()
+                                    .text_color(text())
+                                    .child(source.label.clone()),
+                            )
+                            .child(
+                                div()
+                                    .flex_1()
+                                    .min_w(px(0.))
+                                    .overflow_hidden()
                                     .text_color(color)
                                     .child(source_health_text(source, now)),
                             )
-                    })),
+                            .child(div().flex_shrink_0().text_color(dim()).child(ssh)),
+                    )
+                    // Line 2: data summary.
+                    .child(div().pl(px(20.)).text_color(muted()).child(summary))
+            }))
+            .child(div().h(px(1.)).w_full().bg(rgb(0x2a2a30)))
+            .child(
+                div()
+                    .font_family(MONO)
+                    .text_xs()
+                    .text_color(text())
+                    .child(format!(
+                        "Σ {active} active · {proj_t} proj · {rnd_t} rnd · {} tok",
+                        ftok(tok_t)
+                    )),
             )
-            .when(!diagnostics.is_empty(), |element| {
-                element.child(
-                    div()
-                        .font_family(MONO)
-                        .text_xs()
-                        .text_color(cost_hi())
-                        .child(diagnostics),
-                )
-            })
     }
 
     fn render_limits(&self) -> impl IntoElement {
@@ -1427,8 +1559,17 @@ impl Dashboard {
                 } else {
                     tab.label().to_string()
                 };
+                let dot = (tab == Tab::Sources).then(|| {
+                    let ok = sources_health_ok(&self.snapshot.sources);
+                    div()
+                        .mr_1()
+                        .text_color(if ok { cost_lo() } else { cost_hi() })
+                        .child("●")
+                });
                 div()
                     .id(SharedString::from(format!("tab-{}", tab.label())))
+                    .flex()
+                    .items_center()
                     .cursor_pointer()
                     .px_1()
                     .py_0p5()
@@ -1441,6 +1582,7 @@ impl Dashboard {
                     })
                     .text_color(if is_active { accent() } else { muted() })
                     .on_click(cx.listener(move |this, _, _, cx| this.set_tab(tab, cx)))
+                    .when_some(dot, |element, dot| element.child(dot))
                     .child(label)
             }))
             .child(div().flex_1())
@@ -2027,7 +2169,9 @@ impl Render for Dashboard {
                 this.schedule_remote_refresh(cx);
                 cx.notify();
             }))
-            .child(self.render_source_filter(cx))
+            .when(self.tab != Tab::Sources, |d| {
+                d.child(self.render_source_filter(cx))
+            })
             .child(self.render_source_status())
             .child(div().h(px(1.)).w_full().bg(rgb(0x2a2a30)))
             .child(self.render_limits())
@@ -2068,6 +2212,12 @@ impl Render for Dashboard {
                     .flex_1()
                     .overflow_y_scroll()
                     .child(self.render_rounds_tab(cx))
+                    .into_any_element(),
+                Tab::Sources => div()
+                    .id("sources-scroll")
+                    .flex_1()
+                    .overflow_y_scroll()
+                    .child(self.render_sources_tab())
                     .into_any_element(),
             })
             .child(
@@ -2583,6 +2733,7 @@ mod json_schema_tests {
             last_success: 10,
             duration_ms: 15,
             error: "offline".into(),
+            summary: None,
         });
         snapshot.diagnostics.config = Some("invalid config".into());
         snapshot
@@ -2635,7 +2786,7 @@ mod json_schema_tests {
     }
 
     #[test]
-    fn view_snapshot_applies_source_filter_and_keeps_limits_separate() {
+    fn view_snapshot_applies_source_filter_and_keeps_limits_local() {
         let now = now_epoch();
         let off = local_offset(now);
         let date = data::timeutil::ymd_str(local_day(now, off));
@@ -2746,13 +2897,16 @@ mod json_schema_tests {
             HashSet::from(["local", "lxc"])
         );
         assert!(all.limits.iter().all(|row| row.agent != "grok"));
-        assert_eq!(
-            all.limits
-                .iter()
-                .map(|row| row.source_id.as_str())
-                .collect::<HashSet<_>>(),
-            HashSet::from(["local", "lxc"])
-        );
+        // Limits are always taken from the local source, regardless of filter.
+        for snap in [&all, &local_only, &remote_only] {
+            assert_eq!(
+                snap.limits
+                    .iter()
+                    .map(|row| row.source_id.as_str())
+                    .collect::<HashSet<_>>(),
+                HashSet::from(["local"])
+            );
+        }
         assert_eq!(all.sources.len(), 2);
     }
 }
@@ -2774,6 +2928,7 @@ mod source_filter_tests {
             last_success: 0,
             duration_ms: 0,
             error: String::new(),
+            summary: None,
         }
     }
 
@@ -2816,6 +2971,7 @@ mod source_status_tests {
             last_success: 100,
             duration_ms: 10,
             error: "offline".into(),
+            summary: None,
         };
         assert_eq!(source_health_icon(source.health), "◐");
         let text = source_health_text(&source, 220);
@@ -2837,6 +2993,44 @@ mod source_aware_view_tests {
         assert!(!source_identity_visible(&SourceFilter::Remote(
             "lxc".into()
         )));
+    }
+
+    #[test]
+    fn sources_totals_sums_only_active_sources() {
+        let make = |id: &str, summary: Option<SourceSummary>| SourceOwned {
+            id: id.into(),
+            label: id.into(),
+            local: false,
+            enabled: true,
+            active: summary.is_some(),
+            health: SourceHealth::Healthy,
+            warnings: Vec::new(),
+            last_attempt: 0,
+            last_success: 0,
+            duration_ms: 0,
+            error: String::new(),
+            summary,
+        };
+        let sources = vec![
+            make(
+                "local",
+                Some(SourceSummary {
+                    projects: 3,
+                    rounds: 10,
+                    tokens: 1000,
+                }),
+            ),
+            make(
+                "dev",
+                Some(SourceSummary {
+                    projects: 2,
+                    rounds: 4,
+                    tokens: 500,
+                }),
+            ),
+            make("off", None),
+        ];
+        assert_eq!(sources_totals(&sources), (2, 5, 14, 1500));
     }
 }
 
@@ -2904,9 +3098,11 @@ mod handle_key_tests {
         d.handle_key(DashboardKey::TabNext);
         assert_eq!(d.tab, Tab::Rounds);
         d.handle_key(DashboardKey::TabNext);
+        assert_eq!(d.tab, Tab::Sources);
+        d.handle_key(DashboardKey::TabNext);
         assert_eq!(d.tab, Tab::Global);
         d.handle_key(DashboardKey::TabPrev);
-        assert_eq!(d.tab, Tab::Rounds);
+        assert_eq!(d.tab, Tab::Sources);
     }
 
     #[test]
