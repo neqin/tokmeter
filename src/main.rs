@@ -1438,16 +1438,10 @@ impl Dashboard {
         const NAME_CHAR: f32 = 7.5;
         const NAME_PAD: f32 = 12.0;
         let rows = &self.snapshot.limits;
-        let show_source = source_identity_visible(&self.source_filter);
+        // Limits are always local, so the source label is redundant in the name.
         let name_w = rows
             .iter()
-            .map(|r| {
-                if show_source {
-                    r.source_label.chars().count() + r.agent.chars().count() + 3
-                } else {
-                    r.agent.chars().count()
-                }
-            })
+            .map(|r| r.agent.chars().count())
             .max()
             .unwrap_or(6) as f32
             * NAME_CHAR
@@ -1468,11 +1462,7 @@ impl Dashboard {
             } else {
                 rows.iter()
                     .map(|r| {
-                        let name = if show_source {
-                            format!("{} · {}", r.source_label, r.agent)
-                        } else {
-                            r.agent.clone()
-                        };
+                        let name = r.agent.clone();
                         let name_color = agent_name_color(&r.agent);
                         let bars: Vec<AnyElement> = if r.windows.is_empty() {
                             vec![div()
