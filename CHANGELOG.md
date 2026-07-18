@@ -1,6 +1,8 @@
 # Changelog
 
 ## [Unreleased]
+
+## 0.1.10 — 2026-07-18
 - feat: custom client-side titlebar with brand, version, clock, and window controls
 - fix: drop redundant "local" prefix from limit names
 
